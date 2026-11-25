@@ -3,9 +3,14 @@
 //! Coordinates user-facing CLI parsing via `clap` and delegates execution
 //! without owning audio decoding, playback, or library internals.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
+
+use crate::audio::{PlaybackEvent, PlaybackState, PlaybackTrackInfo};
 
 /// Top-level command-line parser for Termwave.
 #[derive(Debug, Parser)]
@@ -77,24 +82,53 @@ pub fn app_banner() -> String {
     format!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
 }
 
+/// Installs a process-wide Ctrl+C handler once and returns the shared shutdown flag.
+fn install_shutdown_handler() -> Arc<AtomicBool> {
+    static SHUTDOWN_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    let flag = SHUTDOWN_FLAG.get_or_init(|| {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let signal_flag = Arc::clone(&shutdown);
+        let _ = ctrlc::set_handler(move || {
+            signal_flag.store(true, Ordering::SeqCst);
+        });
+        shutdown
+    });
+    Arc::clone(flag)
+}
+
 /// Parses arguments from the process environment and executes the selected command.
 pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    execute(cli)
+    let shutdown = install_shutdown_handler();
+    execute_with_shutdown(cli, shutdown)
 }
 
 /// Executes a parsed [`Cli`] command.
 pub fn execute(cli: Cli) -> anyhow::Result<()> {
+    execute_with_shutdown(cli, Arc::new(AtomicBool::new(false)))
+}
+
+/// Executes a parsed [`Cli`] command with an explicit shutdown signal flag.
+pub fn execute_with_shutdown(cli: Cli, shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
     match cli.command {
         Some(Commands::Play(args)) => {
-            let validated = crate::audio::validate_audio_file(&args.file)?;
-            println!(
-                "{} — validated {} file: {} ({} bytes)",
-                app_banner(),
-                validated.format,
-                validated.path.display(),
-                validated.size_bytes
-            );
+            println!("{}", app_banner());
+            let summary =
+                crate::audio::play_local_flac(&args.file, shutdown, |event| match event {
+                    PlaybackEvent::StateChanged(state) => {
+                        println!("Status:  {state}");
+                    }
+                    PlaybackEvent::TrackLoaded(info) => {
+                        print_track_info(&info);
+                    }
+                })?;
+
+            if summary.final_state == PlaybackState::Stopped {
+                println!(
+                    "Playback stopped after {}",
+                    format_duration(summary.elapsed)
+                );
+            }
             Ok(())
         }
         Some(Commands::Info(_)) => {
@@ -116,6 +150,54 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+fn print_track_info(info: &PlaybackTrackInfo) {
+    let display_name = file_display_name(&info.file.path);
+    let bit_depth = info
+        .stream
+        .bits_per_sample
+        .map_or_else(|| "unknown".to_string(), |bits| format!("{bits}-bit"));
+    let duration = info
+        .stream
+        .duration
+        .map_or_else(|| "unknown".to_string(), format_duration);
+
+    println!("Track:   {display_name} ({} bytes)", info.file.size_bytes);
+    println!(
+        "Source:  {} | {} Hz | {} | {} | {}",
+        info.stream.codec,
+        info.stream.sample_rate,
+        bit_depth,
+        format_channels(info.stream.channels),
+        duration
+    );
+    println!(
+        "Output:  {} | {} Hz | {} ch | {}",
+        info.output.name, info.output.sample_rate, info.output.channels, info.output.sample_format
+    );
+}
+
+fn file_display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn format_channels(channels: u16) -> String {
+    match channels {
+        1 => "1 ch (Mono)".to_string(),
+        2 => "2 ch (Stereo)".to_string(),
+        count => format!("{count} ch"),
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_millis = duration.as_millis();
+    let minutes = total_millis / 60_000;
+    let seconds = (total_millis % 60_000) / 1_000;
+    let hundredths = (total_millis % 1_000) / 10;
+    format!("{minutes:02}:{seconds:02}.{hundredths:02}")
 }
 
 #[cfg(test)]
@@ -169,21 +251,36 @@ mod tests {
     }
 
     #[test]
-    fn execute_play_validates_existing_and_missing_files() {
+    fn execute_play_plays_valid_flac_and_rejects_missing_file() {
         let missing = Cli::try_parse_from(["termwave", "play", "does_not_exist_12345.flac"])
             .expect("CLI syntax is valid");
         assert!(execute(missing).is_err());
 
-        let temp_file = std::env::temp_dir().join(format!(
-            "termwave_cli_play_test_{}.flac",
-            std::process::id()
-        ));
-        std::fs::write(&temp_file, b"fLaC\x00\x00\x00\x22payload").expect("write temp flac");
-        let valid = Cli::try_parse_from(["termwave", "play", &temp_file.to_string_lossy()])
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("sine_16bit_44100_stereo.flac");
+        let valid = Cli::try_parse_from(["termwave", "play", &fixture.to_string_lossy()])
             .expect("CLI syntax is valid");
-        let result = execute(valid);
-        let _ = std::fs::remove_file(&temp_file);
-        assert!(result.is_ok());
+        match execute(valid) {
+            Ok(()) => {}
+            Err(err) => {
+                // Allow headless CI without audio hardware, fail on any other error.
+                let is_no_device = err
+                    .downcast_ref::<crate::audio::AudioError>()
+                    .is_some_and(|e| matches!(e, crate::audio::AudioError::NoOutputDevice));
+                assert!(is_no_device, "unexpected CLI play error: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn formats_duration_and_channels_cleanly() {
+        assert_eq!(format_duration(Duration::from_millis(100)), "00:00.10");
+        assert_eq!(format_duration(Duration::from_secs(125)), "02:05.00");
+        assert_eq!(format_channels(1), "1 ch (Mono)");
+        assert_eq!(format_channels(2), "2 ch (Stereo)");
+        assert_eq!(format_channels(6), "6 ch");
     }
 
     #[test]

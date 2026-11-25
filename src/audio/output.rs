@@ -80,7 +80,6 @@ impl AudioOutput {
     }
 
     /// Returns a reference to the underlying mixer for audio playback scheduling.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn mixer(&self) -> &rodio::mixer::Mixer {
         self.sink.mixer()
     }

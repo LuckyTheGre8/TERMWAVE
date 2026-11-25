@@ -13,7 +13,8 @@ src/
 │   ├── mod.rs         # PlaybackState lifecycle and AudioError definitions
 │   ├── validation.rs  # Local audio file existence, permission, and format validation
 │   ├── decoder.rs     # Source-agnostic Symphonia FLAC decoder and AudioStreamInfo
-│   └── output.rs      # Encapsulated rodio/cpal system audio output initialization
+│   ├── output.rs      # Encapsulated rodio/cpal system audio output initialization
+│   └── playback.rs    # Bounded-channel decoder worker and rodio playback pipeline
 ├── metadata.rs        # Tag and embedded artwork extraction boundary
 ├── library.rs         # Music library scanning, search, and SQLite boundary
 ├── config.rs          # User preferences and platform-aware defaults
@@ -29,7 +30,7 @@ src/
 - Planned companion UI layer (`tui` in later phases) will follow the same rule: presentation reads state and dispatches commands without blocking playback.
 
 ### `audio` (`src/audio/`)
-- Owns local file validation (`validation.rs`), source-agnostic FLAC decoding (`decoder.rs` powered by Symphonia), system audio output initialization (`output.rs` encapsulating `rodio`/`cpal`), and playback lifecycle (`PlaybackState`).
+- Owns local file validation (`validation.rs`), source-agnostic FLAC decoding (`decoder.rs` powered by Symphonia), system audio output initialization (`output.rs` encapsulating `rodio`/`cpal`), bounded-channel playback execution (`playback.rs`), and playback lifecycle (`PlaybackState`).
 - Target internal layering (implemented incrementally across Stages 1–6):
   `Playback Manager -> Audio Source Abstraction -> Audio Decoder -> Audio Processing Pipeline -> Audio Output Backend -> System Audio Device`.
 - Decoders must remain decoupled from filesystem paths so local files, HTTP streams, and network sources share the same playback pipeline.

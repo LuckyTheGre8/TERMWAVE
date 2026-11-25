@@ -7,6 +7,7 @@
 
 pub mod decoder;
 pub mod output;
+pub mod playback;
 pub mod validation;
 
 use std::fmt;
@@ -15,6 +16,7 @@ use thiserror::Error;
 
 pub use decoder::{AudioStreamInfo, FlacDecoder};
 pub use output::{AudioOutput, OutputDeviceInfo, detect_default_output_device};
+pub use playback::{PlaybackEvent, PlaybackSummary, PlaybackTrackInfo, play_local_flac};
 pub use validation::{AudioFormat, ValidatedAudioFile, validate_audio_file};
 
 /// Clearly defined lifecycle state of the playback engine.

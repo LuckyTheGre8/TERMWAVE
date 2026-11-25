@@ -11,7 +11,7 @@ Termwave is a lightweight, cross-platform, lossless-first terminal Hi-Fi music p
 
 ## Status
 
-Currently at **Phase 06 (Audio output initialization)** of the development roadmap in [AGENTS.md](AGENTS.md). The `clap`-based CLI interface, local FLAC file validation, Symphonia-based FLAC decoding, and `rodio`/`cpal` system audio output initialization (`AudioOutput::open_default` and `detect_default_output_device`) are implemented; end-to-end local FLAC playback will be connected in Phases 07–08.
+Currently at **Phase 07 (Basic playback)** of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play <file>` validates local FLAC files, decodes audio on a dedicated worker thread via Symphonia, outputs through the default system audio device via `rodio`/`cpal`, displays source and output properties plus playback status, and handles clean Ctrl+C shutdown. Error-handling hardening follows in Phase 08 (Milestone 1).
 
 ## Usage
 
@@ -26,7 +26,7 @@ termwave play <file>
 - `src/main.rs` — Thin binary entry point
 - `src/lib.rs` — Core library exports
 - `src/cli.rs` — Command-line interface boundary
-- `src/audio/` — Audio engine boundary (`PlaybackState`, `validation`, `decoder`, and `output`)
+- `src/audio/` — Audio engine boundary (`PlaybackState`, `validation`, `decoder`, `output`, and `playback`)
 - `src/metadata.rs` — Metadata and embedded artwork boundary
 - `src/library.rs` — Music library and SQLite persistence boundary
 - `src/config.rs` — Configuration boundary
