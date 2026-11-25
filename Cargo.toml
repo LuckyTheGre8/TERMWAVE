@@ -1,0 +1,12 @@
+[package]
+name = "termwave"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A lightweight, cross-platform, lossless-first terminal Hi-Fi music player"
+readme = "README.md"
+keywords = ["audio", "flac", "music", "player", "terminal"]
+categories = ["multimedia::audio", "command-line-utilities"]
+
+# Dependencies are introduced incrementally per roadmap phase.
+[dependencies]

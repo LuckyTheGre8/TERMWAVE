@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Environment and secrets
+.env
+.env.*
+
+# Local database and runtime artifacts
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
