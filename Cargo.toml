@@ -10,3 +10,5 @@ categories = ["multimedia::audio", "command-line-utilities"]
 
 # Dependencies are introduced incrementally per roadmap phase.
 [dependencies]
+anyhow = "1.0"
+thiserror = "2.0"

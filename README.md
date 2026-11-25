@@ -11,7 +11,20 @@ Termwave is a lightweight, cross-platform, lossless-first terminal Hi-Fi music p
 
 ## Status
 
-Currently at **Phase 01 (Project initialization)** of the development roadmap in [AGENTS.md](AGENTS.md). Playback, CLI commands, metadata extraction, and the terminal UI will be implemented incrementally in subsequent phases.
+Currently at **Phase 02 (Modular architecture)** of the development roadmap in [AGENTS.md](AGENTS.md). Core module boundaries and error-handling conventions are established; CLI argument parsing, file validation, decoding, and playback will be implemented incrementally in subsequent phases.
+
+## Module Structure
+
+- `src/main.rs` — Thin binary entry point
+- `src/lib.rs` — Core library exports
+- `src/cli.rs` — Command-line interface boundary
+- `src/audio.rs` — Audio engine boundary and `PlaybackState`
+- `src/metadata.rs` — Metadata and embedded artwork boundary
+- `src/library.rs` — Music library and SQLite persistence boundary
+- `src/config.rs` — Configuration boundary
+- `src/error.rs` — Unified `TermwaveError` (`thiserror`) and `Result<T>`
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for architecture boundaries and error-handling conventions.
 
 ## Prerequisites
 
