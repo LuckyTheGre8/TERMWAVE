@@ -11,7 +11,7 @@ Termwave is a lightweight, cross-platform, lossless-first terminal Hi-Fi music p
 
 ## Status
 
-Currently at **Phase 05 (FLAC decoding)** of the development roadmap in [AGENTS.md](AGENTS.md). The `clap`-based CLI interface, local FLAC file validation, and Symphonia-based streaming FLAC decoding (`FlacDecoder` supporting 16-bit/24-bit and 44.1/48/96/192 kHz mono/stereo configurations) are implemented; audio output initialization and playback will be implemented in Phases 06–08.
+Currently at **Phase 06 (Audio output initialization)** of the development roadmap in [AGENTS.md](AGENTS.md). The `clap`-based CLI interface, local FLAC file validation, Symphonia-based FLAC decoding, and `rodio`/`cpal` system audio output initialization (`AudioOutput::open_default` and `detect_default_output_device`) are implemented; end-to-end local FLAC playback will be connected in Phases 07–08.
 
 ## Usage
 
@@ -26,7 +26,7 @@ termwave play <file>
 - `src/main.rs` — Thin binary entry point
 - `src/lib.rs` — Core library exports
 - `src/cli.rs` — Command-line interface boundary
-- `src/audio/` — Audio engine boundary (`PlaybackState`, `validation`, and `decoder`)
+- `src/audio/` — Audio engine boundary (`PlaybackState`, `validation`, `decoder`, and `output`)
 - `src/metadata.rs` — Metadata and embedded artwork boundary
 - `src/library.rs` — Music library and SQLite persistence boundary
 - `src/config.rs` — Configuration boundary
@@ -36,9 +36,9 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for architecture boundaries and
 
 ## Prerequisites
 
-- Rust toolchain (`rustc` 1.85+ / Edition 2024) and `cargo`
-- On Windows: Visual Studio C++ Build Tools (MSVC + Windows SDK)
-- On Linux: Standard C toolchain and system audio development libraries when audio output is introduced in later phases
+- Rust toolchain (`rustc` 1.87+ / Edition 2024) and `cargo`
+- On Windows: Visual Studio C++ Build Tools (MSVC + Windows SDK; uses WASAPI for audio output)
+- On Linux: Standard C toolchain and ALSA development headers (`alsa-lib` / `libasound2-dev`) or PipeWire/ALSA compatibility layer for `cpal` audio output
 
 ## Building and Verification
 

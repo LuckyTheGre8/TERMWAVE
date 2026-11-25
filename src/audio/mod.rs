@@ -6,6 +6,7 @@
 //! terminal rendering and blocking library operations.
 
 pub mod decoder;
+pub mod output;
 pub mod validation;
 
 use std::fmt;
@@ -13,6 +14,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 pub use decoder::{AudioStreamInfo, FlacDecoder};
+pub use output::{AudioOutput, OutputDeviceInfo, detect_default_output_device};
 pub use validation::{AudioFormat, ValidatedAudioFile, validate_audio_file};
 
 /// Clearly defined lifecycle state of the playback engine.
@@ -114,6 +116,10 @@ pub enum AudioError {
     /// Attempted an operation that is invalid in the current playback state.
     #[error("invalid playback state: {0}")]
     InvalidState(String),
+
+    /// No audio output device is available on the system.
+    #[error("no audio output device available")]
+    NoOutputDevice,
 
     /// System audio output backend failure.
     #[error("audio output backend failure: {0}")]
