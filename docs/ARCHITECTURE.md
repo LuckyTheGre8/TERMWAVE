@@ -11,7 +11,8 @@ src/
 ├── cli.rs             # CLI command interface and user-facing entry flow
 ├── audio/             # Audio engine boundary
 │   ├── mod.rs         # PlaybackState lifecycle and AudioError definitions
-│   └── validation.rs  # Local audio file existence, permission, and format validation
+│   ├── validation.rs  # Local audio file existence, permission, and format validation
+│   └── decoder.rs     # Source-agnostic Symphonia FLAC decoder and AudioStreamInfo
 ├── metadata.rs        # Tag and embedded artwork extraction boundary
 ├── library.rs         # Music library scanning, search, and SQLite boundary
 ├── config.rs          # User preferences and platform-aware defaults
@@ -27,7 +28,7 @@ src/
 - Planned companion UI layer (`tui` in later phases) will follow the same rule: presentation reads state and dispatches commands without blocking playback.
 
 ### `audio` (`src/audio/`)
-- Owns local file validation (`validation.rs`), playback lifecycle (`PlaybackState`: `Stopped`, `Loading`, `Playing`, `Paused`, `Buffering`, `Seeking`, `Ended`, `Error`), and future audio engine layers.
+- Owns local file validation (`validation.rs`), source-agnostic FLAC decoding (`decoder.rs` powered by Symphonia), playback lifecycle (`PlaybackState`: `Stopped`, `Loading`, `Playing`, `Paused`, `Buffering`, `Seeking`, `Ended`, `Error`), and future output layers.
 - Target internal layering (implemented incrementally across Stages 1–6):
   `Playback Manager -> Audio Source Abstraction -> Audio Decoder -> Audio Processing Pipeline -> Audio Output Backend -> System Audio Device`.
 - Decoders must remain decoupled from filesystem paths so local files, HTTP streams, and network sources share the same playback pipeline.

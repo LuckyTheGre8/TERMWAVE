@@ -12,4 +12,5 @@ categories = ["multimedia::audio", "command-line-utilities"]
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
+symphonia = { version = "0.5", default-features = false, features = ["flac"] }
 thiserror = "2.0"

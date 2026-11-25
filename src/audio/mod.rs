@@ -5,12 +5,14 @@
 //! Audio callbacks and real-time processing remain strictly isolated from
 //! terminal rendering and blocking library operations.
 
+pub mod decoder;
 pub mod validation;
 
 use std::fmt;
 use std::path::PathBuf;
 use thiserror::Error;
 
+pub use decoder::{AudioStreamInfo, FlacDecoder};
 pub use validation::{AudioFormat, ValidatedAudioFile, validate_audio_file};
 
 /// Clearly defined lifecycle state of the playback engine.
@@ -100,6 +102,14 @@ pub enum AudioError {
         /// Details about the unsupported extension or header.
         reason: String,
     },
+
+    /// Audio stream uses an unsupported sample rate, channel layout, bit depth, or codec.
+    #[error("unsupported audio configuration: {0}")]
+    UnsupportedConfiguration(String),
+
+    /// Audio stream could not be decoded or is corrupted.
+    #[error("audio decode error: {0}")]
+    DecodeError(String),
 
     /// Attempted an operation that is invalid in the current playback state.
     #[error("invalid playback state: {0}")]
