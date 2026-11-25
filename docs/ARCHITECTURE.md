@@ -19,7 +19,8 @@ src/
 ## Module Responsibilities and Boundaries
 
 ### `cli` (`src/cli.rs`)
-- Handles command-line entry and delegates work to lower-level subsystems.
+- Parses command-line arguments and subcommands using `clap` (`play <file>` plus planned `info`, `scan`, `tui`, and `devices` subcommands).
+- Handles command-line entry, `--help` / `--version`, and delegates work to lower-level subsystems.
 - Must not own decoding, audio device management, or database logic.
 - Planned companion UI layer (`tui` in later phases) will follow the same rule: presentation reads state and dispatches commands without blocking playback.
 

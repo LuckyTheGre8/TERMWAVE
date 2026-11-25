@@ -11,7 +11,15 @@ Termwave is a lightweight, cross-platform, lossless-first terminal Hi-Fi music p
 
 ## Status
 
-Currently at **Phase 02 (Modular architecture)** of the development roadmap in [AGENTS.md](AGENTS.md). Core module boundaries and error-handling conventions are established; CLI argument parsing, file validation, decoding, and playback will be implemented incrementally in subsequent phases.
+Currently at **Phase 03 (CLI interface)** of the development roadmap in [AGENTS.md](AGENTS.md). The `clap`-based CLI interface (`--help`, `--version`, `termwave play <file>`, and planned future subcommands) is implemented; file validation, FLAC decoding, and audio playback will be implemented incrementally in Phases 04–08.
+
+## Usage
+
+```sh
+termwave --help
+termwave --version
+termwave play <file>
+```
 
 ## Module Structure
 
