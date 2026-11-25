@@ -87,7 +87,14 @@ pub fn run() -> anyhow::Result<()> {
 pub fn execute(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Some(Commands::Play(args)) => {
-            println!("{} — play target: {}", app_banner(), args.file.display());
+            let validated = crate::audio::validate_audio_file(&args.file)?;
+            println!(
+                "{} — validated {} file: {} ({} bytes)",
+                app_banner(),
+                validated.format,
+                validated.path.display(),
+                validated.size_bytes
+            );
             Ok(())
         }
         Some(Commands::Info(_)) => {
@@ -159,7 +166,24 @@ mod tests {
                 file: PathBuf::from("music/sample.flac"),
             }))
         );
-        assert!(execute(cli).is_ok());
+    }
+
+    #[test]
+    fn execute_play_validates_existing_and_missing_files() {
+        let missing = Cli::try_parse_from(["termwave", "play", "does_not_exist_12345.flac"])
+            .expect("CLI syntax is valid");
+        assert!(execute(missing).is_err());
+
+        let temp_file = std::env::temp_dir().join(format!(
+            "termwave_cli_play_test_{}.flac",
+            std::process::id()
+        ));
+        std::fs::write(&temp_file, b"fLaC\x00\x00\x00\x22payload").expect("write temp flac");
+        let valid = Cli::try_parse_from(["termwave", "play", &temp_file.to_string_lossy()])
+            .expect("CLI syntax is valid");
+        let result = execute(valid);
+        let _ = std::fs::remove_file(&temp_file);
+        assert!(result.is_ok());
     }
 
     #[test]

@@ -6,14 +6,16 @@ Termwave separates presentation, playback, metadata extraction, library persiste
 
 ```text
 src/
-├── main.rs      # Thin binary entry point (propagates anyhow::Result)
-├── lib.rs       # Library root exposing top-level module boundaries
-├── cli.rs       # CLI command interface and user-facing entry flow
-├── audio.rs     # Audio engine boundary and PlaybackState lifecycle
-├── metadata.rs  # Tag and embedded artwork extraction boundary
-├── library.rs   # Music library scanning, search, and SQLite boundary
-├── config.rs    # User preferences and platform-aware defaults
-└── error.rs     # Unified TermwaveError and crate Result<T> alias
+├── main.rs            # Thin binary entry point (propagates anyhow::Result)
+├── lib.rs             # Library root exposing top-level module boundaries
+├── cli.rs             # CLI command interface and user-facing entry flow
+├── audio/             # Audio engine boundary
+│   ├── mod.rs         # PlaybackState lifecycle and AudioError definitions
+│   └── validation.rs  # Local audio file existence, permission, and format validation
+├── metadata.rs        # Tag and embedded artwork extraction boundary
+├── library.rs         # Music library scanning, search, and SQLite boundary
+├── config.rs          # User preferences and platform-aware defaults
+└── error.rs           # Unified TermwaveError and crate Result<T> alias
 ```
 
 ## Module Responsibilities and Boundaries
@@ -24,8 +26,8 @@ src/
 - Must not own decoding, audio device management, or database logic.
 - Planned companion UI layer (`tui` in later phases) will follow the same rule: presentation reads state and dispatches commands without blocking playback.
 
-### `audio` (`src/audio.rs`)
-- Owns the audio playback lifecycle (`PlaybackState`: `Stopped`, `Loading`, `Playing`, `Paused`, `Buffering`, `Seeking`, `Ended`, `Error`).
+### `audio` (`src/audio/`)
+- Owns local file validation (`validation.rs`), playback lifecycle (`PlaybackState`: `Stopped`, `Loading`, `Playing`, `Paused`, `Buffering`, `Seeking`, `Ended`, `Error`), and future audio engine layers.
 - Target internal layering (implemented incrementally across Stages 1–6):
   `Playback Manager -> Audio Source Abstraction -> Audio Decoder -> Audio Processing Pipeline -> Audio Output Backend -> System Audio Device`.
 - Decoders must remain decoupled from filesystem paths so local files, HTTP streams, and network sources share the same playback pipeline.

@@ -1,12 +1,17 @@
 //! Audio engine boundary.
 //!
-//! This module will house the audio source abstraction, decoder integration,
-//! processing pipeline, playback manager, and platform output backend.
+//! This module houses the audio source validation, playback state model,
+//! and future decoder, processing pipeline, and platform output backend.
 //! Audio callbacks and real-time processing remain strictly isolated from
 //! terminal rendering and blocking library operations.
 
+pub mod validation;
+
 use std::fmt;
+use std::path::PathBuf;
 use thiserror::Error;
+
+pub use validation::{AudioFormat, ValidatedAudioFile, validate_audio_file};
 
 /// Clearly defined lifecycle state of the playback engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -50,6 +55,52 @@ impl fmt::Display for PlaybackState {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AudioError {
+    /// Provided filesystem path is syntactically invalid or unusable.
+    #[error("invalid audio file path '{}': {reason}", path.display())]
+    InvalidPath {
+        /// Path that failed validation.
+        path: PathBuf,
+        /// Explanation of why the path is invalid.
+        reason: String,
+    },
+
+    /// Audio file does not exist at the specified location.
+    #[error("audio file not found: '{}'", path.display())]
+    FileNotFound {
+        /// Missing file path.
+        path: PathBuf,
+    },
+
+    /// Path exists but does not refer to a regular file.
+    #[error("path is not a regular file: '{}'", path.display())]
+    NotAFile {
+        /// Path pointing to a directory or special file.
+        path: PathBuf,
+    },
+
+    /// Insufficient permissions to inspect or read the audio file.
+    #[error("permission denied accessing audio file: '{}'", path.display())]
+    PermissionDenied {
+        /// Unreadable file path.
+        path: PathBuf,
+    },
+
+    /// File is zero bytes long and contains no audio stream.
+    #[error("audio file is empty (0 bytes): '{}'", path.display())]
+    EmptyFile {
+        /// Empty file path.
+        path: PathBuf,
+    },
+
+    /// File extension or container signature is not supported.
+    #[error("unsupported audio format for '{}': {reason}", path.display())]
+    UnsupportedFormat {
+        /// File path with an unsupported or unrecognized format.
+        path: PathBuf,
+        /// Details about the unsupported extension or header.
+        reason: String,
+    },
+
     /// Attempted an operation that is invalid in the current playback state.
     #[error("invalid playback state: {0}")]
     InvalidState(String),
