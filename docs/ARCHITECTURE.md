@@ -30,12 +30,15 @@ src/
 - Planned companion UI layer (`tui` in later phases) will follow the same rule: presentation reads state and dispatches commands without blocking playback.
 
 ### `audio` (`src/audio/`)
-- Owns local file validation (`validation.rs`), source-agnostic FLAC decoding (`decoder.rs` powered by Symphonia), system audio output initialization (`output.rs` encapsulating `rodio`/`cpal`), bounded-channel playback execution (`playback.rs`), and playback lifecycle (`PlaybackState`).
+- Owns local file validation (`validation.rs`), source-agnostic FLAC decoding (`decoder.rs` powered by Symphonia), system audio output initialization (`output.rs` encapsulating `rodio`/`cpal`), bounded-channel playback execution and control (`playback.rs` with `PlaybackController`), and the validated `PlaybackState` lifecycle (`mod.rs`).
 - Target internal layering (implemented incrementally across Stages 1–6):
   `Playback Manager -> Audio Source Abstraction -> Audio Decoder -> Audio Processing Pipeline -> Audio Output Backend -> System Audio Device`.
 - Decoders must remain decoupled from filesystem paths so local files, HTTP streams, and network sources share the same playback pipeline.
 - Seeking capability must be represented explicitly rather than assumed for every source.
 - Audio callbacks must remain non-blocking and free of disk/network I/O or UI synchronization locks.
+- State machine & playback control:
+  - `PlaybackState::can_transition_to` and `PlaybackState::transition_to` enforce valid engine lifecycle transitions and reject invalid operations via `AudioError::InvalidState`.
+  - `PlaybackController` provides thread-safe `pause()`, `resume()`, `toggle_pause()`, active playback elapsed timing (excluding paused duration), and non-blocking state queries without stalling the audio output path.
 - Robust error propagation:
   - Input validation traps nonexistent, empty, non-file, unsupported, and process-locked audio files before playback begins.
   - Decoder traps corrupted headers, truncated packets, unsupported sample formats/rates, and non-finite (`NaN`/`Inf`) PCM audio samples.

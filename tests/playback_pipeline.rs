@@ -2,11 +2,15 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use termwave::audio::{AudioError, PlaybackEvent, PlaybackState, play_local_flac};
+use termwave::audio::{
+    AudioError, PlaybackController, PlaybackEvent, PlaybackState, play_local_flac,
+    play_local_flac_with_controller,
+};
 
 fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -255,5 +259,144 @@ fn reports_error_for_truncated_stream_mid_playback() {
         }
         Err(AudioError::NoOutputDevice) => {}
         other => panic!("expected DecodeError, got {other:?}"),
+    }
+}
+
+#[test]
+fn supports_pause_and_resume_with_state_validation_during_playback() {
+    let controller = PlaybackController::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let notified_start = Arc::new(AtomicBool::new(false));
+
+    let worker_controller = controller.clone();
+    let worker_shutdown = Arc::clone(&shutdown);
+    let worker_events = Arc::clone(&events);
+    let worker_notified = Arc::clone(&notified_start);
+    let path = fixture_path("sine_24bit_192000_stereo.flac");
+
+    let handle = thread::spawn(move || {
+        play_local_flac_with_controller(path, worker_controller, worker_shutdown, |event| {
+            if let PlaybackEvent::StateChanged(state) = event {
+                worker_events.lock().unwrap().push(state);
+                if state == PlaybackState::Playing && !worker_notified.swap(true, Ordering::AcqRel)
+                {
+                    let _ = started_tx.try_send(());
+                }
+            }
+        })
+    });
+
+    if started_rx.recv_timeout(Duration::from_secs(3)).is_ok() {
+        // Invalid: resuming while already playing.
+        assert!(matches!(
+            controller.resume(),
+            Err(AudioError::InvalidState(_))
+        ));
+
+        // Valid: Playing -> Paused.
+        controller.pause().unwrap();
+        assert_eq!(controller.state(), PlaybackState::Paused);
+        assert!(controller.is_paused());
+
+        // Invalid: pausing while already paused.
+        assert!(matches!(
+            controller.pause(),
+            Err(AudioError::InvalidState(_))
+        ));
+
+        // Remain paused longer than the track duration (100ms) and verify playback does not end.
+        thread::sleep(Duration::from_millis(160));
+        assert_eq!(controller.state(), PlaybackState::Paused);
+
+        // Valid: Paused -> Playing.
+        controller.resume().unwrap();
+        assert_eq!(controller.state(), PlaybackState::Playing);
+        assert!(controller.is_playing());
+    }
+
+    match handle.join().expect("playback thread should join cleanly") {
+        Ok(summary) => {
+            assert_eq!(summary.final_state, PlaybackState::Ended);
+            assert_eq!(controller.state(), PlaybackState::Ended);
+            // Post-completion pause/resume must be rejected.
+            assert!(matches!(
+                controller.pause(),
+                Err(AudioError::InvalidState(_))
+            ));
+            assert!(matches!(
+                controller.resume(),
+                Err(AudioError::InvalidState(_))
+            ));
+
+            let recorded = events.lock().unwrap().clone();
+            assert_eq!(
+                recorded,
+                vec![
+                    PlaybackState::Loading,
+                    PlaybackState::Playing,
+                    PlaybackState::Paused,
+                    PlaybackState::Playing,
+                    PlaybackState::Ended,
+                ]
+            );
+        }
+        Err(AudioError::NoOutputDevice) => {
+            // Acceptable in headless CI environments without audio hardware.
+        }
+        Err(other) => panic!("unexpected playback error: {other}"),
+    }
+}
+
+#[test]
+fn supports_shutdown_while_playback_is_paused() {
+    let controller = PlaybackController::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let notified_start = Arc::new(AtomicBool::new(false));
+
+    let worker_controller = controller.clone();
+    let worker_shutdown = Arc::clone(&shutdown);
+    let worker_events = Arc::clone(&events);
+    let worker_notified = Arc::clone(&notified_start);
+    let path = fixture_path("sine_24bit_192000_stereo.flac");
+
+    let handle = thread::spawn(move || {
+        play_local_flac_with_controller(path, worker_controller, worker_shutdown, |event| {
+            if let PlaybackEvent::StateChanged(state) = event {
+                worker_events.lock().unwrap().push(state);
+                if state == PlaybackState::Playing && !worker_notified.swap(true, Ordering::AcqRel)
+                {
+                    let _ = started_tx.try_send(());
+                }
+            }
+        })
+    });
+
+    if started_rx.recv_timeout(Duration::from_secs(3)).is_ok() {
+        controller.pause().unwrap();
+        assert_eq!(controller.state(), PlaybackState::Paused);
+        shutdown.store(true, Ordering::Release);
+    }
+
+    match handle.join().expect("playback thread should join cleanly") {
+        Ok(summary) => {
+            assert_eq!(summary.final_state, PlaybackState::Stopped);
+            assert_eq!(controller.state(), PlaybackState::Stopped);
+            let recorded = events.lock().unwrap().clone();
+            assert_eq!(
+                recorded,
+                vec![
+                    PlaybackState::Loading,
+                    PlaybackState::Playing,
+                    PlaybackState::Paused,
+                    PlaybackState::Stopped,
+                ]
+            );
+        }
+        Err(AudioError::NoOutputDevice) => {}
+        Err(other) => panic!("unexpected playback error: {other}"),
     }
 }

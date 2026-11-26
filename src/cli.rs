@@ -3,14 +3,16 @@
 //! Coordinates user-facing CLI parsing via `clap` and delegates execution
 //! without owning audio decoding, playback, or library internals.
 
+use std::io::{self, BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::thread;
 use std::time::Duration;
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
-use crate::audio::{PlaybackEvent, PlaybackState, PlaybackTrackInfo};
+use crate::audio::{PlaybackController, PlaybackEvent, PlaybackState, PlaybackTrackInfo};
 
 /// Top-level command-line parser for Termwave.
 #[derive(Debug, Parser)]
@@ -96,11 +98,84 @@ fn install_shutdown_handler() -> Arc<AtomicBool> {
     Arc::clone(flag)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybackControlAction {
+    TogglePause,
+    Pause,
+    Resume,
+}
+
+fn parse_playback_control_command(line: &str) -> Option<PlaybackControlAction> {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "" | "p" | "toggle" => Some(PlaybackControlAction::TogglePause),
+        "pause" => Some(PlaybackControlAction::Pause),
+        "resume" | "play" => Some(PlaybackControlAction::Resume),
+        _ => None,
+    }
+}
+
+fn apply_playback_control_action(
+    controller: &PlaybackController,
+    action: PlaybackControlAction,
+) -> Result<PlaybackState, crate::audio::AudioError> {
+    match action {
+        PlaybackControlAction::TogglePause => controller.toggle_pause(),
+        PlaybackControlAction::Pause => {
+            controller.pause()?;
+            Ok(PlaybackState::Paused)
+        }
+        PlaybackControlAction::Resume => {
+            controller.resume()?;
+            Ok(PlaybackState::Playing)
+        }
+    }
+}
+
+fn spawn_stdin_control_thread(controller: PlaybackController, active: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        let mut line = String::new();
+        while active.load(Ordering::Acquire) {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if !active.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if let Some(action) = parse_playback_control_command(&line) {
+                        if let Err(err) = apply_playback_control_action(&controller, action) {
+                            eprintln!("Note:    {err}");
+                        }
+                    } else {
+                        eprintln!(
+                            "Note:    unknown control '{}' (use Enter/'p' to toggle, 'pause', 'resume', or Ctrl+C to quit)",
+                            line.trim()
+                        );
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
 /// Parses arguments from the process environment and executes the selected command.
 pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let shutdown = install_shutdown_handler();
-    execute_with_shutdown(cli, shutdown)
+    match &cli.command {
+        Some(Commands::Play(args)) if io::stdin().is_terminal() => {
+            let controller = PlaybackController::new();
+            let active = Arc::new(AtomicBool::new(true));
+            spawn_stdin_control_thread(controller.clone(), Arc::clone(&active));
+            let result = execute_play(&args.file, controller, shutdown, true);
+            active.store(false, Ordering::Release);
+            result
+        }
+        _ => execute_with_shutdown(cli, shutdown),
+    }
 }
 
 /// Executes a parsed [`Cli`] command.
@@ -112,24 +187,7 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
 pub fn execute_with_shutdown(cli: Cli, shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
     match cli.command {
         Some(Commands::Play(args)) => {
-            println!("{}", app_banner());
-            let summary =
-                crate::audio::play_local_flac(&args.file, shutdown, |event| match event {
-                    PlaybackEvent::StateChanged(state) => {
-                        println!("Status:  {state}");
-                    }
-                    PlaybackEvent::TrackLoaded(info) => {
-                        print_track_info(&info);
-                    }
-                })?;
-
-            if summary.final_state == PlaybackState::Stopped {
-                println!(
-                    "Playback stopped after {}",
-                    format_duration(summary.elapsed)
-                );
-            }
-            Ok(())
+            execute_play(&args.file, PlaybackController::new(), shutdown, false)
         }
         Some(Commands::Info(_)) => {
             anyhow::bail!("the 'info' subcommand is planned for a future phase")
@@ -150,6 +208,41 @@ pub fn execute_with_shutdown(cli: Cli, shutdown: Arc<AtomicBool>) -> anyhow::Res
             Ok(())
         }
     }
+}
+
+fn execute_play(
+    file: &Path,
+    controller: PlaybackController,
+    shutdown: Arc<AtomicBool>,
+    show_controls_hint: bool,
+) -> anyhow::Result<()> {
+    println!("{}", app_banner());
+    let summary = crate::audio::play_local_flac_with_controller(
+        file,
+        controller,
+        shutdown,
+        |event| match event {
+            PlaybackEvent::StateChanged(state) => {
+                println!("Status:  {state}");
+            }
+            PlaybackEvent::TrackLoaded(info) => {
+                print_track_info(&info);
+                if show_controls_hint {
+                    println!(
+                        "Controls: press Enter or 'p' + Enter to pause/resume, or Ctrl+C to quit"
+                    );
+                }
+            }
+        },
+    )?;
+
+    if summary.final_state == PlaybackState::Stopped {
+        println!(
+            "Playback stopped after {}",
+            format_duration(summary.elapsed)
+        );
+    }
+    Ok(())
 }
 
 fn print_track_info(info: &PlaybackTrackInfo) {
@@ -330,5 +423,43 @@ mod tests {
         let cli = Cli::try_parse_from(["termwave"]).unwrap();
         assert_eq!(cli.command, None);
         assert!(execute(cli).is_ok());
+    }
+
+    #[test]
+    fn parses_interactive_playback_control_commands() {
+        assert_eq!(
+            parse_playback_control_command("\n"),
+            Some(PlaybackControlAction::TogglePause)
+        );
+        assert_eq!(
+            parse_playback_control_command("  p "),
+            Some(PlaybackControlAction::TogglePause)
+        );
+        assert_eq!(
+            parse_playback_control_command("TOGGLE"),
+            Some(PlaybackControlAction::TogglePause)
+        );
+        assert_eq!(
+            parse_playback_control_command("pause"),
+            Some(PlaybackControlAction::Pause)
+        );
+        assert_eq!(
+            parse_playback_control_command("RESUME"),
+            Some(PlaybackControlAction::Resume)
+        );
+        assert_eq!(
+            parse_playback_control_command("play"),
+            Some(PlaybackControlAction::Resume)
+        );
+        assert_eq!(parse_playback_control_command("seek"), None);
+    }
+
+    #[test]
+    fn applies_playback_control_actions_with_state_validation() {
+        let controller = PlaybackController::new();
+        assert!(matches!(
+            apply_playback_control_action(&controller, PlaybackControlAction::TogglePause),
+            Err(crate::audio::AudioError::InvalidState(_))
+        ));
     }
 }

@@ -16,7 +16,10 @@ use thiserror::Error;
 
 pub use decoder::{AudioStreamInfo, FlacDecoder};
 pub use output::{AudioOutput, OutputDeviceInfo, detect_default_output_device};
-pub use playback::{PlaybackEvent, PlaybackSummary, PlaybackTrackInfo, play_local_flac};
+pub use playback::{
+    PlaybackController, PlaybackEvent, PlaybackSummary, PlaybackTrackInfo, play_local_flac,
+    play_local_flac_with_controller,
+};
 pub use validation::{AudioFormat, ValidatedAudioFile, validate_audio_file};
 
 /// Clearly defined lifecycle state of the playback engine.
@@ -39,6 +42,56 @@ pub enum PlaybackState {
     Ended,
     /// Playback halted due to a recoverable or fatal error.
     Error,
+}
+
+impl PlaybackState {
+    /// Returns `true` if transitioning from `self` to `next` is valid.
+    pub fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Stopped, Self::Loading)
+                | (
+                    Self::Loading,
+                    Self::Playing | Self::Buffering | Self::Stopped | Self::Error
+                )
+                | (
+                    Self::Playing,
+                    Self::Paused
+                        | Self::Seeking
+                        | Self::Buffering
+                        | Self::Stopped
+                        | Self::Ended
+                        | Self::Error
+                )
+                | (
+                    Self::Paused,
+                    Self::Playing | Self::Seeking | Self::Stopped | Self::Error
+                )
+                | (
+                    Self::Buffering,
+                    Self::Playing | Self::Paused | Self::Stopped | Self::Error
+                )
+                | (
+                    Self::Seeking,
+                    Self::Playing | Self::Paused | Self::Buffering | Self::Stopped | Self::Error
+                )
+                | (Self::Ended | Self::Error, Self::Loading | Self::Stopped)
+        )
+    }
+
+    /// Validates and applies a transition from `self` to `next`.
+    ///
+    /// Returns [`AudioError::InvalidState`] if the transition is not permitted.
+    pub fn transition_to(&mut self, next: Self) -> Result<(), AudioError> {
+        if self.can_transition_to(next) {
+            *self = next;
+            Ok(())
+        } else {
+            Err(AudioError::InvalidState(format!(
+                "cannot transition playback state from {self} to {next}"
+            )))
+        }
+    }
 }
 
 impl fmt::Display for PlaybackState {
@@ -144,5 +197,57 @@ mod tests {
     fn playback_state_defaults_to_stopped() {
         assert_eq!(PlaybackState::default(), PlaybackState::Stopped);
         assert_eq!(PlaybackState::Stopped.to_string(), "Stopped");
+    }
+
+    #[test]
+    fn playback_state_allows_valid_transitions_and_rejects_invalid_ones() {
+        let mut state = PlaybackState::Stopped;
+
+        // Invalid from Stopped
+        assert!(matches!(
+            state.transition_to(PlaybackState::Paused),
+            Err(AudioError::InvalidState(_))
+        ));
+        assert!(matches!(
+            state.transition_to(PlaybackState::Playing),
+            Err(AudioError::InvalidState(_))
+        ));
+        assert!(matches!(
+            state.transition_to(PlaybackState::Ended),
+            Err(AudioError::InvalidState(_))
+        ));
+        assert_eq!(state, PlaybackState::Stopped);
+
+        // Stopped -> Loading -> Playing -> Paused -> Playing -> Ended -> Stopped
+        state.transition_to(PlaybackState::Loading).unwrap();
+        assert!(matches!(
+            state.transition_to(PlaybackState::Paused),
+            Err(AudioError::InvalidState(_))
+        ));
+        state.transition_to(PlaybackState::Playing).unwrap();
+        assert!(matches!(
+            state.transition_to(PlaybackState::Playing),
+            Err(AudioError::InvalidState(_))
+        ));
+        state.transition_to(PlaybackState::Paused).unwrap();
+        assert!(matches!(
+            state.transition_to(PlaybackState::Paused),
+            Err(AudioError::InvalidState(_))
+        ));
+        assert!(matches!(
+            state.transition_to(PlaybackState::Ended),
+            Err(AudioError::InvalidState(_))
+        ));
+        state.transition_to(PlaybackState::Playing).unwrap();
+        state.transition_to(PlaybackState::Ended).unwrap();
+        assert!(matches!(
+            state.transition_to(PlaybackState::Paused),
+            Err(AudioError::InvalidState(_))
+        ));
+        assert!(matches!(
+            state.transition_to(PlaybackState::Playing),
+            Err(AudioError::InvalidState(_))
+        ));
+        state.transition_to(PlaybackState::Stopped).unwrap();
     }
 }
