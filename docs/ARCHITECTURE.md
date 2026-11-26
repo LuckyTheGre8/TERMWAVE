@@ -43,6 +43,7 @@ src/
   - `PlaybackController` provides thread-safe `pause()`, `resume()`, `toggle_pause()`, `stop()`, `next_track()`, `previous_track()`, bounded queue/history inspection, active playback position tracking (resetting on stop or track change), cancellation during loading, and immediate release of audio player, output sink, and decoder worker resources.
   - `TrackQueue` (`queue.rs`) tracks current queue position, visited back-navigation stack, chronological played history (bounded to avoid unbounded memory growth), and start/end boundary guards.
   - `VolumeState` (`volume.rs`) validates gain strictly within `[0.0, 1.0]` (unity-capped to prevent overdrive clipping), preserves configured volume across mute toggles and track transitions, and `prevent_clipping` bounds PCM output samples within `[-1.0, 1.0]`.
+  - Seeking (`decoder.rs` + `SeekCoordinator` in `playback.rs`) represents stream seekability explicitly via `SeekCapabilities`, executes forward/backward/absolute FLAC seeks on the decoder worker thread (never inside real-time audio callbacks), trims partial leading frames accurately, and preserves `Playing` or `Paused` state across seeks.
 - Robust error propagation:
   - Input validation traps nonexistent, empty, non-file, unsupported, and process-locked audio files before playback begins.
   - Decoder traps corrupted headers, truncated packets, unsupported sample formats/rates, and non-finite (`NaN`/`Inf`) PCM audio samples.

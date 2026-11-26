@@ -16,7 +16,7 @@ use std::fmt;
 use std::path::PathBuf;
 use thiserror::Error;
 
-pub use decoder::{AudioStreamInfo, FlacDecoder};
+pub use decoder::{AudioStreamInfo, DEFAULT_SEEK_STEP, FlacDecoder, SeekCapabilities};
 pub use output::{AudioOutput, OutputDeviceInfo, detect_default_output_device};
 pub use playback::{
     PlaybackController, PlaybackEvent, PlaybackSummary, PlaybackTrackInfo, play_local_flac,
@@ -183,6 +183,14 @@ pub enum AudioError {
     /// Provided volume level or adjustment is invalid or out of range.
     #[error("invalid audio volume: {0}")]
     InvalidVolume(String),
+
+    /// Audio source does not support seeking operations.
+    #[error("seeking unsupported: {0}")]
+    SeekUnsupported(String),
+
+    /// Failed to seek within the audio stream.
+    #[error("audio seek error: {0}")]
+    SeekError(String),
 
     /// No audio output device is available on the system.
     #[error("no audio output device available")]

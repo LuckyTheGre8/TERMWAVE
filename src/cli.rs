@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
-use crate::audio::{PlaybackController, PlaybackEvent, PlaybackState, PlaybackTrackInfo};
+use crate::audio::{
+    DEFAULT_SEEK_STEP, PlaybackController, PlaybackEvent, PlaybackState, PlaybackTrackInfo,
+};
 
 /// Top-level command-line parser for Termwave.
 #[derive(Debug, Parser)]
@@ -113,6 +115,9 @@ enum PlaybackControlAction {
     Resume,
     NextTrack,
     PreviousTrack,
+    SeekForward,
+    SeekBackward,
+    SeekAbsolute(String),
     VolumeUp,
     VolumeDown,
     SetVolume(String),
@@ -130,6 +135,9 @@ fn parse_playback_control_command(line: &str) -> Option<PlaybackControlAction> {
     {
         return Some(PlaybackControlAction::SetVolume(arg.trim().to_string()));
     }
+    if let Some(arg) = lower.strip_prefix("seek ") {
+        return Some(PlaybackControlAction::SeekAbsolute(arg.trim().to_string()));
+    }
 
     match lower.as_str() {
         "" | "space" | "pp" | "toggle" => Some(PlaybackControlAction::TogglePause),
@@ -137,6 +145,8 @@ fn parse_playback_control_command(line: &str) -> Option<PlaybackControlAction> {
         "resume" | "play" => Some(PlaybackControlAction::Resume),
         "n" | "next" => Some(PlaybackControlAction::NextTrack),
         "p" | "prev" | "previous" => Some(PlaybackControlAction::PreviousTrack),
+        "f" | "ff" | "fwd" | "right" | ">" => Some(PlaybackControlAction::SeekForward),
+        "b" | "bb" | "rew" | "back" | "left" | "<" => Some(PlaybackControlAction::SeekBackward),
         "+" | "up" | "vol+" => Some(PlaybackControlAction::VolumeUp),
         "-" | "down" | "vol-" => Some(PlaybackControlAction::VolumeDown),
         "m" | "mute" => Some(PlaybackControlAction::ToggleMute),
@@ -144,6 +154,42 @@ fn parse_playback_control_command(line: &str) -> Option<PlaybackControlAction> {
         "s" | "stop" | "q" | "quit" => Some(PlaybackControlAction::Stop),
         _ => None,
     }
+}
+
+fn parse_seek_position(raw: &str) -> Result<Duration, crate::audio::AudioError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(crate::audio::AudioError::SeekError(
+            "seek target cannot be empty".to_string(),
+        ));
+    }
+
+    if let Some((mins_str, secs_str)) = trimmed.split_once(':') {
+        let mins: u64 = mins_str.parse().map_err(|_| {
+            crate::audio::AudioError::SeekError(format!("invalid seek timestamp '{trimmed}'"))
+        })?;
+        let secs: f64 = secs_str.parse().map_err(|_| {
+            crate::audio::AudioError::SeekError(format!("invalid seek timestamp '{trimmed}'"))
+        })?;
+        if !secs.is_finite() || !(0.0..60.0).contains(&secs) {
+            return Err(crate::audio::AudioError::SeekError(format!(
+                "seconds component in '{trimmed}' must be in 0..60"
+            )));
+        }
+        return Ok(Duration::from_secs_f64((mins as f64) * 60.0 + secs));
+    }
+
+    let secs: f64 = trimmed.parse().map_err(|_| {
+        crate::audio::AudioError::SeekError(format!(
+            "expected seconds or mm:ss timestamp, got '{trimmed}'"
+        ))
+    })?;
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(crate::audio::AudioError::SeekError(format!(
+            "seek position must be a non-negative finite number, got '{trimmed}'"
+        )));
+    }
+    Ok(Duration::from_secs_f64(secs))
 }
 
 fn apply_playback_control_action(
@@ -166,6 +212,19 @@ fn apply_playback_control_action(
         }
         PlaybackControlAction::PreviousTrack => {
             controller.previous_track()?;
+            Ok(controller.state())
+        }
+        PlaybackControlAction::SeekForward => {
+            controller.seek_forward(DEFAULT_SEEK_STEP)?;
+            Ok(controller.state())
+        }
+        PlaybackControlAction::SeekBackward => {
+            controller.seek_backward(DEFAULT_SEEK_STEP)?;
+            Ok(controller.state())
+        }
+        PlaybackControlAction::SeekAbsolute(raw) => {
+            let pos = parse_seek_position(raw)?;
+            controller.seek(pos)?;
             Ok(controller.state())
         }
         PlaybackControlAction::VolumeUp => {
@@ -241,7 +300,7 @@ fn spawn_stdin_control_thread(controller: PlaybackController, active: Arc<Atomic
                         }
                     } else {
                         eprintln!(
-                            "Note:    unknown control '{}' (use Enter/'toggle', 'n'/'next', 'p'/'prev', '+'/'-'/'vol <0..100>', 'm'/'mute', 's'/'stop', Ctrl+C)",
+                            "Note:    unknown control '{}' (Enter/'toggle', 'n'/'p', 'f'/'b'/'seek <t>', '+'/'-'/'m', 's', Ctrl+C)",
                             line.trim()
                         );
                     }
@@ -332,7 +391,7 @@ fn execute_play(
                 if show_controls_hint && !hint_printed {
                     hint_printed = true;
                     println!(
-                        "Controls: Enter/'toggle' pause, 'n' next, 'p' prev, '+'/'-' vol, 'm' mute, 's' stop, Ctrl+C quit"
+                        "Controls: Enter/'toggle' pause, 'n'/'p' track, 'f'/'b'/'seek <t>' seek, '+'/'-'/'m' vol, 's' stop, Ctrl+C"
                     );
                 }
             }
@@ -635,7 +694,32 @@ mod tests {
             parse_playback_control_command("quit"),
             Some(PlaybackControlAction::Stop)
         );
+        assert_eq!(
+            parse_playback_control_command("f"),
+            Some(PlaybackControlAction::SeekForward)
+        );
+        assert_eq!(
+            parse_playback_control_command("back"),
+            Some(PlaybackControlAction::SeekBackward)
+        );
+        assert_eq!(
+            parse_playback_control_command("seek 1:30"),
+            Some(PlaybackControlAction::SeekAbsolute("1:30".to_string()))
+        );
         assert_eq!(parse_playback_control_command("seek"), None);
+
+        assert_eq!(parse_seek_position("90").unwrap(), Duration::from_secs(90));
+        assert_eq!(
+            parse_seek_position("1:30").unwrap(),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            parse_seek_position("0:02.5").unwrap(),
+            Duration::from_millis(2500)
+        );
+        assert!(parse_seek_position("-5").is_err());
+        assert!(parse_seek_position("1:75").is_err());
+        assert!(parse_seek_position("abc").is_err());
     }
 
     #[test]
@@ -651,6 +735,17 @@ mod tests {
         ));
         assert!(matches!(
             apply_playback_control_action(&controller, &PlaybackControlAction::PreviousTrack),
+            Err(crate::audio::AudioError::InvalidState(_))
+        ));
+        assert!(matches!(
+            apply_playback_control_action(&controller, &PlaybackControlAction::SeekForward),
+            Err(crate::audio::AudioError::InvalidState(_))
+        ));
+        assert!(matches!(
+            apply_playback_control_action(
+                &controller,
+                &PlaybackControlAction::SeekAbsolute("10".into())
+            ),
             Err(crate::audio::AudioError::InvalidState(_))
         ));
         assert!(matches!(

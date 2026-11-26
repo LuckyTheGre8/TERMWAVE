@@ -697,3 +697,82 @@ fn supports_volume_adjustment_and_mute_across_playlist_playback() {
         Err(other) => panic!("unexpected playback error: {other}"),
     }
 }
+
+#[test]
+fn supports_seeking_during_playback_and_pause() {
+    let controller = PlaybackController::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (playing_tx, playing_rx) = std::sync::mpsc::sync_channel::<PlaybackState>(16);
+
+    let worker_controller = controller.clone();
+    let worker_shutdown = Arc::clone(&shutdown);
+    let worker_events = Arc::clone(&events);
+    let path = fixture_path("sine_24bit_192000_stereo.flac");
+
+    let handle = thread::spawn(move || {
+        play_local_flac_with_controller(path, worker_controller, worker_shutdown, |event| {
+            if let PlaybackEvent::StateChanged(state) = event {
+                worker_events.lock().unwrap().push(state);
+                if matches!(state, PlaybackState::Playing | PlaybackState::Paused) {
+                    let _ = playing_tx.try_send(state);
+                }
+            }
+        })
+    });
+
+    if let Ok(PlaybackState::Playing) = playing_rx.recv_timeout(Duration::from_secs(3)) {
+        assert!(controller.is_seekable());
+        assert_eq!(controller.duration(), Some(Duration::from_millis(100)));
+
+        // Seek forward during active playback
+        let landed_fwd = controller.seek_forward(Duration::from_millis(40)).unwrap();
+        assert!(landed_fwd >= Duration::from_millis(35));
+        assert_eq!(
+            playing_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            PlaybackState::Playing
+        );
+
+        // Pause and perform absolute + backward seeking while Paused
+        controller.pause().unwrap();
+        assert_eq!(
+            playing_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            PlaybackState::Paused
+        );
+
+        let landed_abs = controller.seek(Duration::from_millis(70)).unwrap();
+        assert_eq!(landed_abs, Duration::from_millis(70));
+        // Seeking while Paused must return cleanly to Paused (not auto-resume!)
+        assert_eq!(
+            playing_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            PlaybackState::Paused
+        );
+        assert!(controller.is_paused());
+
+        let landed_back = controller.seek_backward(Duration::from_millis(50)).unwrap();
+        assert_eq!(landed_back, Duration::from_millis(20));
+        assert_eq!(
+            playing_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            PlaybackState::Paused
+        );
+        assert!(controller.is_paused());
+
+        // Resume from seeked position and finish cleanly
+        controller.resume().unwrap();
+    }
+
+    match handle.join().expect("playback thread should join cleanly") {
+        Ok(summary) => {
+            assert_eq!(summary.final_state, PlaybackState::Ended);
+            let recorded = events.lock().unwrap().clone();
+            assert!(
+                recorded.contains(&PlaybackState::Seeking),
+                "expected Seeking state event in {recorded:?}"
+            );
+            assert_eq!(recorded.first(), Some(&PlaybackState::Loading));
+            assert_eq!(recorded.last(), Some(&PlaybackState::Ended));
+        }
+        Err(AudioError::NoOutputDevice) => {}
+        Err(other) => panic!("unexpected playback error: {other}"),
+    }
+}

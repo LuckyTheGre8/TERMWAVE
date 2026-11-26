@@ -17,7 +17,7 @@ use rodio::{ChannelCount, Player, SampleRate, Source};
 
 use super::{
     AudioError, AudioOutput, AudioStreamInfo, DEFAULT_VOLUME_STEP, FlacDecoder, OutputDeviceInfo,
-    PlaybackState, TrackQueue, ValidatedAudioFile, VolumeState, prevent_clipping,
+    PlaybackState, SeekCapabilities, TrackQueue, ValidatedAudioFile, VolumeState, prevent_clipping,
     validate_audio_file,
 };
 
@@ -49,6 +49,9 @@ struct ControllerInner {
     player: Option<Player>,
     queue: Option<TrackQueue>,
     volume: VolumeState,
+    seek_capabilities: SeekCapabilities,
+    seek_coordinator: Option<Arc<SeekCoordinator>>,
+    resume_after_seek: PlaybackState,
     stop_signal: Option<Arc<AtomicBool>>,
     stop_requested: bool,
     track_switch_requested: bool,
@@ -57,6 +60,103 @@ struct ControllerInner {
     total_session_elapsed: Duration,
     last_stopped_elapsed: Duration,
     pending_events: VecDeque<PlaybackState>,
+}
+
+#[derive(Default)]
+struct SeekCoordinator {
+    state: Mutex<SeekCoordinatorState>,
+    worker_wake: Condvar,
+}
+
+#[derive(Default)]
+struct SeekCoordinatorState {
+    generation: u64,
+    pending_seek: Option<(u64, Duration)>,
+    ready_seek: Option<ReadySeek>,
+}
+
+struct ReadySeek {
+    generation: u64,
+    landed_position: Duration,
+    rx: Receiver<Vec<f32>>,
+    decoder_done: Arc<AtomicBool>,
+}
+
+impl SeekCoordinator {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn request_seek(&self, target: Duration) -> u64 {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.generation = guard.generation.saturating_add(1);
+        let generation = guard.generation;
+        guard.pending_seek = Some((generation, target));
+        guard.ready_seek = None;
+        self.worker_wake.notify_all();
+        generation
+    }
+
+    fn is_superseded(&self, expected_generation: u64) -> bool {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.generation != expected_generation || guard.pending_seek.is_some()
+    }
+
+    fn take_pending_seek(&self) -> Option<(u64, Duration)> {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.pending_seek.take()
+    }
+
+    fn publish_ready_seek(&self, ready: ReadySeek) {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.generation == ready.generation && guard.pending_seek.is_none() {
+            guard.ready_seek = Some(ready);
+        }
+    }
+
+    fn take_ready_seek(&self) -> Option<ReadySeek> {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.pending_seek.is_some() {
+            return None;
+        }
+        guard.ready_seek.take()
+    }
+
+    fn clear_requests(&self) {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.generation = guard.generation.saturating_add(1);
+        guard.pending_seek = None;
+        guard.ready_seek = None;
+        self.worker_wake.notify_all();
+    }
+
+    fn wait_while_idle(&self, stop_decoder: &AtomicBool, timeout: Duration) {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !stop_decoder.load(Ordering::Acquire) && guard.pending_seek.is_none() {
+            let _ = self.worker_wake.wait_timeout(guard, timeout);
+        }
+    }
 }
 
 enum TrackNavigationDirection {
@@ -105,9 +205,7 @@ impl ControllerInner {
         if let Some(player) = &self.player {
             player.pause();
         }
-        if let Some(started) = self.active_since.take() {
-            self.accumulated_elapsed += started.elapsed();
-        }
+        let _ = self.pause_active_timer();
         self.pending_events.push_back(PlaybackState::Paused);
         Ok(())
     }
@@ -135,13 +233,16 @@ impl ControllerInner {
             ));
         }
 
-        let track_elapsed = self.settle_active_elapsed();
-        self.total_session_elapsed += track_elapsed;
+        let track_elapsed = self.pause_active_timer();
+        let _ = track_elapsed;
         self.last_stopped_elapsed = self.total_session_elapsed;
         // Reset active playback position on stop.
         self.accumulated_elapsed = Duration::ZERO;
-        self.active_since = None;
         self.track_switch_requested = false;
+        self.seek_capabilities = SeekCapabilities::default();
+        if let Some(coord) = &self.seek_coordinator {
+            coord.clear_requests();
+        }
 
         if let Some(player) = self.player.take() {
             player.stop();
@@ -164,7 +265,10 @@ impl ControllerInner {
     ) -> Result<PathBuf, AudioError> {
         if !matches!(
             self.state,
-            PlaybackState::Loading | PlaybackState::Playing | PlaybackState::Paused
+            PlaybackState::Loading
+                | PlaybackState::Playing
+                | PlaybackState::Paused
+                | PlaybackState::Seeking
         ) {
             return Err(AudioError::InvalidState(format!(
                 "cannot navigate tracks while in state {}",
@@ -183,10 +287,12 @@ impl ControllerInner {
             TrackNavigationDirection::Previous => queue.step_previous()?.to_path_buf(),
         };
 
-        let track_elapsed = self.settle_active_elapsed();
-        self.total_session_elapsed += track_elapsed;
+        let _ = self.pause_active_timer();
         self.accumulated_elapsed = Duration::ZERO;
-        self.active_since = None;
+        self.seek_capabilities = SeekCapabilities::default();
+        if let Some(coord) = &self.seek_coordinator {
+            coord.clear_requests();
+        }
 
         if let Some(player) = self.player.take() {
             player.stop();
@@ -202,11 +308,58 @@ impl ControllerInner {
         Ok(target)
     }
 
-    fn settle_active_elapsed(&mut self) -> Duration {
-        if let Some(started) = self.active_since.take() {
-            self.accumulated_elapsed += started.elapsed();
+    fn apply_seek(&mut self, target: Duration) -> Result<Duration, AudioError> {
+        if !matches!(
+            self.state,
+            PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Seeking
+        ) {
+            return Err(AudioError::InvalidState(format!(
+                "cannot seek while in state {}",
+                self.state
+            )));
         }
-        self.accumulated_elapsed
+
+        if !self.seek_capabilities.is_seekable {
+            return Err(AudioError::SeekUnsupported(
+                "audio source does not support seeking".to_string(),
+            ));
+        }
+
+        let clamped = match self.seek_capabilities.duration {
+            Some(dur) if target > dur => dur,
+            _ => target,
+        };
+
+        let _ = self.pause_active_timer();
+        self.accumulated_elapsed = clamped;
+
+        if self.state != PlaybackState::Seeking {
+            self.resume_after_seek = self.state;
+            self.state.transition_to(PlaybackState::Seeking)?;
+            self.pending_events.push_back(PlaybackState::Seeking);
+        }
+
+        if let Some(player) = &self.player {
+            player.pause();
+            player.clear();
+        }
+
+        if let Some(coord) = &self.seek_coordinator {
+            coord.request_seek(clamped);
+        }
+
+        Ok(clamped)
+    }
+
+    fn pause_active_timer(&mut self) -> Duration {
+        if let Some(started) = self.active_since.take() {
+            let span = started.elapsed();
+            self.accumulated_elapsed += span;
+            self.total_session_elapsed += span;
+            span
+        } else {
+            Duration::ZERO
+        }
     }
 
     fn apply_player_volume(&self) {
@@ -467,6 +620,56 @@ impl PlaybackController {
         muted
     }
 
+    /// Returns explicit seeking capabilities for the active track.
+    pub fn seek_capabilities(&self) -> SeekCapabilities {
+        self.lock_inner().seek_capabilities
+    }
+
+    /// Returns `true` if the active track source supports seeking.
+    pub fn is_seekable(&self) -> bool {
+        self.lock_inner().seek_capabilities.is_seekable
+    }
+
+    /// Returns the total duration of the active track, if known.
+    pub fn duration(&self) -> Option<Duration> {
+        self.lock_inner().seek_capabilities.duration
+    }
+
+    /// Seeks playback to an absolute `position`, preserving `Playing` or `Paused` state.
+    ///
+    /// Returns [`AudioError::SeekUnsupported`] if the active source is not seekable,
+    /// or [`AudioError::InvalidState`] if playback is not currently active or paused.
+    pub fn seek(&self, position: Duration) -> Result<Duration, AudioError> {
+        let mut inner = self.lock_inner();
+        let landed = inner.apply_seek(position)?;
+        self.shared.state_changed.notify_all();
+        Ok(landed)
+    }
+
+    /// Seeks forward by `delta` relative to the current playback position.
+    ///
+    /// Clamps cleanly at the track duration when known and preserves `Playing`/`Paused` state.
+    pub fn seek_forward(&self, delta: Duration) -> Result<Duration, AudioError> {
+        let mut inner = self.lock_inner();
+        let current =
+            inner.accumulated_elapsed + inner.active_since.map_or(Duration::ZERO, |t| t.elapsed());
+        let landed = inner.apply_seek(current.saturating_add(delta))?;
+        self.shared.state_changed.notify_all();
+        Ok(landed)
+    }
+
+    /// Seeks backward by `delta` relative to the current playback position.
+    ///
+    /// Clamps cleanly at `Duration::ZERO` and preserves `Playing`/`Paused` state.
+    pub fn seek_backward(&self, delta: Duration) -> Result<Duration, AudioError> {
+        let mut inner = self.lock_inner();
+        let current =
+            inner.accumulated_elapsed + inner.active_since.map_or(Duration::ZERO, |t| t.elapsed());
+        let landed = inner.apply_seek(current.saturating_sub(delta))?;
+        self.shared.state_changed.notify_all();
+        Ok(landed)
+    }
+
     fn lock_inner(&self) -> std::sync::MutexGuard<'_, ControllerInner> {
         self.shared
             .inner
@@ -488,6 +691,11 @@ impl PlaybackController {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_seek_capabilities_for_test(&self, capabilities: SeekCapabilities) {
+        self.lock_inner().seek_capabilities = capabilities;
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_active_player(&self) -> bool {
         self.lock_inner().player.is_some()
     }
@@ -497,6 +705,9 @@ impl PlaybackController {
         inner.state.transition_to(PlaybackState::Loading)?;
         inner.player = None;
         inner.queue = Some(queue);
+        inner.seek_capabilities = SeekCapabilities::default();
+        inner.seek_coordinator = None;
+        inner.resume_after_seek = PlaybackState::Stopped;
         inner.stop_signal = None;
         inner.stop_requested = false;
         inner.track_switch_requested = false;
@@ -511,6 +722,79 @@ impl PlaybackController {
     #[cfg(test)]
     fn begin_loading(&self) -> Result<(), AudioError> {
         self.begin_loading_with_queue(TrackQueue::new(Vec::new()))
+    }
+
+    fn set_track_seek_context(
+        &self,
+        capabilities: SeekCapabilities,
+        coordinator: Arc<SeekCoordinator>,
+    ) {
+        let mut inner = self.lock_inner();
+        inner.seek_capabilities = capabilities;
+        inner.seek_coordinator = Some(coordinator);
+    }
+
+    fn complete_ready_seek_if_any(
+        &self,
+        channels: ChannelCount,
+        sample_rate: SampleRate,
+        duration: Option<Duration>,
+    ) -> Option<Arc<AtomicBool>> {
+        let ready = {
+            let inner = self.lock_inner();
+            inner
+                .seek_coordinator
+                .as_ref()
+                .and_then(|coord| coord.take_ready_seek())
+        }?;
+
+        let mut inner = self.lock_inner();
+        if inner.state != PlaybackState::Seeking
+            || inner.stop_requested
+            || inner.track_switch_requested
+        {
+            return None;
+        }
+        let still_current = inner.seek_coordinator.as_ref().is_some_and(|coord| {
+            let guard = coord
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.generation == ready.generation && guard.pending_seek.is_none()
+        });
+        if !still_current {
+            return None;
+        }
+
+        let target_state = inner.resume_after_seek;
+        let effective_volume = inner.volume.effective_level();
+        inner.accumulated_elapsed = ready.landed_position;
+        if let Some(player) = &inner.player {
+            let source = ChannelAudioSource::new(
+                Vec::new(),
+                ready.rx,
+                channels,
+                sample_rate,
+                duration,
+                Arc::clone(&ready.decoder_done),
+            );
+            player.set_volume(effective_volume);
+            player.append(source);
+            match target_state {
+                PlaybackState::Playing => player.play(),
+                PlaybackState::Paused => player.pause(),
+                _ => {}
+            }
+        }
+        inner.active_since = if target_state == PlaybackState::Playing {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let _ = inner.state.transition_to(target_state);
+        inner.pending_events.push_back(target_state);
+        self.shared.state_changed.notify_all();
+        Some(ready.decoder_done)
     }
 
     fn take_track_switch(&self) -> bool {
@@ -594,10 +878,13 @@ impl PlaybackController {
             return TrackEndOutcome::StillPlaying;
         }
 
-        let track_elapsed = inner.settle_active_elapsed();
-        inner.total_session_elapsed += track_elapsed;
+        let _ = inner.pause_active_timer();
         drop(inner.player.take());
         inner.stop_signal = None;
+        inner.seek_capabilities = SeekCapabilities::default();
+        if let Some(coord) = inner.seek_coordinator.take() {
+            coord.clear_requests();
+        }
 
         if inner
             .queue
@@ -630,20 +917,27 @@ impl PlaybackController {
             inner.track_switch_requested = false;
         }
         inner.stop_signal = None;
+        inner.seek_capabilities = SeekCapabilities::default();
+        if let Some(coord) = inner.seek_coordinator.take() {
+            coord.clear_requests();
+        }
         self.shared.state_changed.notify_all();
         inner.last_stopped_elapsed
     }
 
     fn fail_active(&self) {
         let mut inner = self.lock_inner();
-        let track_elapsed = inner.settle_active_elapsed();
-        inner.total_session_elapsed += track_elapsed;
+        let _ = inner.pause_active_timer();
         if let Some(player) = inner.player.take() {
             player.stop();
             drop(player);
         }
         inner.stop_signal = None;
         inner.track_switch_requested = false;
+        inner.seek_capabilities = SeekCapabilities::default();
+        if let Some(coord) = inner.seek_coordinator.take() {
+            coord.clear_requests();
+        }
         let _ = inner.state.transition_to(PlaybackState::Error);
         self.shared.state_changed.notify_all();
     }
@@ -773,15 +1067,13 @@ fn play_single_queue_track(
     on_event(PlaybackEvent::StateChanged(PlaybackState::Loading));
 
     if should_stop_now(controller, shutdown) {
-        return Ok(TrackWaitOutcome::Stopped(finish_with_stop(
+        return Ok(stop_before_worker(
             controller,
-            None,
-            None,
             None,
             AudioStreamInfo::uninitialized(),
             OutputDeviceInfo::uninitialized(),
             on_event,
-        )));
+        ));
     }
     if controller.take_track_switch() {
         return Ok(TrackWaitOutcome::SwitchTrack);
@@ -791,15 +1083,13 @@ fn play_single_queue_track(
         Ok(file) => file,
         Err(err) => {
             if should_stop_now(controller, shutdown) {
-                return Ok(TrackWaitOutcome::Stopped(finish_with_stop(
+                return Ok(stop_before_worker(
                     controller,
-                    None,
-                    None,
                     None,
                     AudioStreamInfo::uninitialized(),
                     OutputDeviceInfo::uninitialized(),
                     on_event,
-                )));
+                ));
             }
             if controller.take_track_switch() {
                 return Ok(TrackWaitOutcome::SwitchTrack);
@@ -809,15 +1099,13 @@ fn play_single_queue_track(
     };
 
     if should_stop_now(controller, shutdown) {
-        return Ok(TrackWaitOutcome::Stopped(finish_with_stop(
+        return Ok(stop_before_worker(
             controller,
-            None,
-            None,
             None,
             AudioStreamInfo::uninitialized(),
             OutputDeviceInfo::uninitialized(),
             on_event,
-        )));
+        ));
     }
     if controller.take_track_switch() {
         return Ok(TrackWaitOutcome::SwitchTrack);
@@ -827,15 +1115,13 @@ fn play_single_queue_track(
         Ok(dec) => dec,
         Err(err) => {
             if should_stop_now(controller, shutdown) {
-                return Ok(TrackWaitOutcome::Stopped(finish_with_stop(
+                return Ok(stop_before_worker(
                     controller,
-                    None,
-                    None,
                     None,
                     AudioStreamInfo::uninitialized(),
                     OutputDeviceInfo::uninitialized(),
                     on_event,
-                )));
+                ));
             }
             if controller.take_track_switch() {
                 return Ok(TrackWaitOutcome::SwitchTrack);
@@ -847,15 +1133,13 @@ fn play_single_queue_track(
     let stream_info = decoder.stream_info().clone();
     if should_stop_now(controller, shutdown) {
         drop(decoder);
-        return Ok(TrackWaitOutcome::Stopped(finish_with_stop(
+        return Ok(stop_before_worker(
             controller,
-            None,
-            None,
             None,
             stream_info,
             OutputDeviceInfo::uninitialized(),
             on_event,
-        )));
+        ));
     }
     if controller.take_track_switch() {
         drop(decoder);
@@ -890,15 +1174,13 @@ fn play_single_queue_track(
         Err(err) => {
             if should_stop_now(controller, shutdown) {
                 drop(decoder);
-                return Ok(TrackWaitOutcome::Stopped(finish_with_stop(
+                return Ok(stop_before_worker(
                     controller,
-                    None,
-                    None,
                     None,
                     stream_info,
                     OutputDeviceInfo::uninitialized(),
                     on_event,
-                )));
+                ));
             }
             if controller.take_track_switch() {
                 drop(decoder);
@@ -911,15 +1193,13 @@ fn play_single_queue_track(
 
     if should_stop_now(controller, shutdown) {
         drop(decoder);
-        return Ok(TrackWaitOutcome::Stopped(finish_with_stop(
+        return Ok(stop_before_worker(
             controller,
             Some(output),
-            None,
-            None,
             stream_info,
             output_info,
             on_event,
-        )));
+        ));
     }
     if controller.take_track_switch() {
         drop(decoder);
@@ -936,6 +1216,8 @@ fn play_single_queue_track(
     let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(PACKET_CHANNEL_CAPACITY);
     let stop_decoder = Arc::new(AtomicBool::new(false));
     let decoder_done = Arc::new(AtomicBool::new(false));
+    let seek_coordinator = Arc::new(SeekCoordinator::new());
+    controller.set_track_seek_context(decoder.seek_capabilities(), Arc::clone(&seek_coordinator));
 
     if !controller.attach_stop_signal(Arc::clone(&stop_decoder)) || shutdown.load(Ordering::Acquire)
     {
@@ -947,6 +1229,7 @@ fn play_single_queue_track(
         return Ok(TrackWaitOutcome::Stopped(finish_with_stop(
             controller,
             Some(output),
+            None,
             None,
             None,
             stream_info,
@@ -961,6 +1244,8 @@ fn play_single_queue_track(
         Arc::clone(&stop_decoder),
         Arc::clone(&decoder_done),
         Arc::clone(&shared_error),
+        Arc::clone(&seek_coordinator),
+        Arc::clone(&controller.shared),
     );
 
     let first_chunk = match wait_for_initial_chunk(
@@ -975,7 +1260,7 @@ fn play_single_queue_track(
         Ok(None) => {
             if controller.take_track_switch() && !should_stop_now(controller, shutdown) {
                 drop(output);
-                join_decoder_worker(decoder_handle, &stop_decoder);
+                join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
                 return Ok(TrackWaitOutcome::SwitchTrack);
             }
             return Ok(TrackWaitOutcome::Stopped(finish_with_stop(
@@ -983,6 +1268,7 @@ fn play_single_queue_track(
                 Some(output),
                 Some(decoder_handle),
                 Some(&stop_decoder),
+                Some(&seek_coordinator),
                 stream_info,
                 output_info,
                 on_event,
@@ -991,7 +1277,7 @@ fn play_single_queue_track(
         Err(err) => {
             controller.fail_active();
             drop(output);
-            join_decoder_worker(decoder_handle, &stop_decoder);
+            join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
             on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
             return Err(err);
         }
@@ -1013,7 +1299,7 @@ fn play_single_queue_track(
         Ok(false) => {
             if controller.take_track_switch() && !should_stop_now(controller, shutdown) {
                 drop(output);
-                join_decoder_worker(decoder_handle, &stop_decoder);
+                join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
                 return Ok(TrackWaitOutcome::SwitchTrack);
             }
             return Ok(TrackWaitOutcome::Stopped(finish_with_stop(
@@ -1021,6 +1307,7 @@ fn play_single_queue_track(
                 Some(output),
                 Some(decoder_handle),
                 Some(&stop_decoder),
+                Some(&seek_coordinator),
                 stream_info,
                 output_info,
                 on_event,
@@ -1029,7 +1316,7 @@ fn play_single_queue_track(
         Err(err) => {
             controller.fail_active();
             drop(output);
-            join_decoder_worker(decoder_handle, &stop_decoder);
+            join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
             on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
             return Err(err);
         }
@@ -1040,11 +1327,14 @@ fn play_single_queue_track(
         controller,
         output,
         decoder_handle,
+        channels,
+        sample_rate,
         stream_info,
         output_info,
         shutdown,
         stop_decoder,
         decoder_done,
+        seek_coordinator,
         shared_error,
         on_event,
     )
@@ -1055,15 +1345,23 @@ fn wait_for_playback(
     controller: &PlaybackController,
     output: AudioOutput,
     decoder_handle: JoinHandle<()>,
+    channels: ChannelCount,
+    sample_rate: SampleRate,
     stream_info: AudioStreamInfo,
     output_info: OutputDeviceInfo,
     shutdown: &AtomicBool,
     stop_decoder: Arc<AtomicBool>,
-    decoder_done: Arc<AtomicBool>,
+    mut decoder_done: Arc<AtomicBool>,
+    seek_coordinator: Arc<SeekCoordinator>,
     shared_error: Arc<Mutex<Option<AudioError>>>,
     on_event: &mut impl FnMut(PlaybackEvent),
 ) -> Result<TrackWaitOutcome, AudioError> {
     loop {
+        if let Some(new_done) =
+            controller.complete_ready_seek_if_any(channels, sample_rate, stream_info.duration)
+        {
+            decoder_done = new_done;
+        }
         controller.drain_pending_events(on_event);
 
         if should_stop_now(controller, shutdown) {
@@ -1072,6 +1370,7 @@ fn wait_for_playback(
                 Some(output),
                 Some(decoder_handle),
                 Some(&stop_decoder),
+                Some(&seek_coordinator),
                 stream_info,
                 output_info,
                 on_event,
@@ -1080,14 +1379,14 @@ fn wait_for_playback(
 
         if controller.take_track_switch() {
             drop(output);
-            join_decoder_worker(decoder_handle, &stop_decoder);
+            join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
             return Ok(TrackWaitOutcome::SwitchTrack);
         }
 
         if let Some(err) = take_shared_error(&shared_error) {
             controller.fail_active();
             drop(output);
-            join_decoder_worker(decoder_handle, &stop_decoder);
+            join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
             controller.drain_pending_events(on_event);
             on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
             return Err(err);
@@ -1098,6 +1397,11 @@ fn wait_for_playback(
             if !controller.is_switch_or_stop_requested(shutdown) {
                 controller.wait_poll_or_event(Duration::from_millis(50));
             }
+            if let Some(new_done) =
+                controller.complete_ready_seek_if_any(channels, sample_rate, stream_info.duration)
+            {
+                decoder_done = new_done;
+            }
             controller.drain_pending_events(on_event);
 
             if should_stop_now(controller, shutdown) {
@@ -1106,6 +1410,7 @@ fn wait_for_playback(
                     Some(output),
                     Some(decoder_handle),
                     Some(&stop_decoder),
+                    Some(&seek_coordinator),
                     stream_info,
                     output_info,
                     on_event,
@@ -1114,14 +1419,14 @@ fn wait_for_playback(
 
             if controller.take_track_switch() {
                 drop(output);
-                join_decoder_worker(decoder_handle, &stop_decoder);
+                join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
                 return Ok(TrackWaitOutcome::SwitchTrack);
             }
 
             if let Some(err) = take_shared_error(&shared_error) {
                 controller.fail_active();
                 drop(output);
-                join_decoder_worker(decoder_handle, &stop_decoder);
+                join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
                 on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
                 return Err(err);
             }
@@ -1130,12 +1435,12 @@ fn wait_for_playback(
                 TrackEndOutcome::StillPlaying => {}
                 TrackEndOutcome::NextTrack => {
                     drop(output);
-                    join_decoder_worker(decoder_handle, &stop_decoder);
+                    join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
                     return Ok(TrackWaitOutcome::SwitchTrack);
                 }
                 TrackEndOutcome::Ended(elapsed) => {
                     drop(output);
-                    join_decoder_worker(decoder_handle, &stop_decoder);
+                    join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
                     controller.drain_pending_events(on_event);
                     on_event(PlaybackEvent::StateChanged(PlaybackState::Ended));
                     return Ok(TrackWaitOutcome::Ended(PlaybackSummary {
@@ -1166,11 +1471,32 @@ fn fail_and_emit(
     err
 }
 
+fn stop_before_worker(
+    controller: &PlaybackController,
+    output: Option<AudioOutput>,
+    stream: AudioStreamInfo,
+    output_info: OutputDeviceInfo,
+    on_event: &mut impl FnMut(PlaybackEvent),
+) -> TrackWaitOutcome {
+    TrackWaitOutcome::Stopped(finish_with_stop(
+        controller,
+        output,
+        None,
+        None,
+        None,
+        stream,
+        output_info,
+        on_event,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn finish_with_stop(
     controller: &PlaybackController,
     output: Option<AudioOutput>,
     decoder_handle: Option<JoinHandle<()>>,
     stop_decoder: Option<&AtomicBool>,
+    seek_coordinator: Option<&SeekCoordinator>,
     stream: AudioStreamInfo,
     output_info: OutputDeviceInfo,
     on_event: &mut impl FnMut(PlaybackEvent),
@@ -1178,7 +1504,7 @@ fn finish_with_stop(
     let elapsed = controller.finalize_stopped();
     drop(output);
     if let (Some(handle), Some(flag)) = (decoder_handle, stop_decoder) {
-        join_decoder_worker(handle, flag);
+        join_decoder_worker(handle, flag, seek_coordinator);
     }
     controller.drain_pending_events(on_event);
     PlaybackSummary {
@@ -1189,50 +1515,118 @@ fn finish_with_stop(
     }
 }
 
+enum ChunkSendOutcome {
+    Sent,
+    SeekRequested,
+    Stopped,
+}
+
 fn spawn_decoder_worker(
     mut decoder: FlacDecoder,
     tx: SyncSender<Vec<f32>>,
     stop_decoder: Arc<AtomicBool>,
-    decoder_done: Arc<AtomicBool>,
+    mut decoder_done: Arc<AtomicBool>,
     shared_error: Arc<Mutex<Option<AudioError>>>,
+    seek_coordinator: Arc<SeekCoordinator>,
+    playback_shared: Arc<PlaybackShared>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        let mut active_tx = Some(tx);
+        let mut active_generation: u64 = 0;
+
         while !stop_decoder.load(Ordering::Acquire) {
-            match decoder.decode_next() {
-                Ok(Some(samples)) => {
-                    if !send_chunk_or_stop(&tx, samples.to_vec(), &stop_decoder) {
+            if let Some((generation, target)) = seek_coordinator.take_pending_seek() {
+                active_tx.take();
+                active_generation = generation;
+                match decoder.seek(target) {
+                    Ok(landed_position) => {
+                        let (new_tx, new_rx) =
+                            mpsc::sync_channel::<Vec<f32>>(PACKET_CHANNEL_CAPACITY);
+                        let new_done = Arc::new(AtomicBool::new(false));
+                        decoder_done = Arc::clone(&new_done);
+                        active_tx = Some(new_tx);
+                        seek_coordinator.publish_ready_seek(ReadySeek {
+                            generation,
+                            landed_position,
+                            rx: new_rx,
+                            decoder_done: new_done,
+                        });
+                        playback_shared.state_changed.notify_all();
+                    }
+                    Err(err) => {
+                        if let Ok(mut slot) = shared_error.lock() {
+                            *slot = Some(err);
+                        }
+                        playback_shared.state_changed.notify_all();
                         break;
                     }
                 }
-                Ok(None) => break,
-                Err(err) => {
-                    if let Ok(mut slot) = shared_error.lock() {
-                        *slot = Some(err);
+            }
+
+            if let Some(sender) = active_tx.as_ref() {
+                match decoder.decode_next() {
+                    Ok(Some(samples)) => {
+                        match send_chunk_or_interrupt(
+                            sender,
+                            samples.to_vec(),
+                            &stop_decoder,
+                            &seek_coordinator,
+                            active_generation,
+                        ) {
+                            ChunkSendOutcome::Sent => {}
+                            ChunkSendOutcome::SeekRequested => continue,
+                            ChunkSendOutcome::Stopped => break,
+                        }
                     }
-                    break;
+                    Ok(None) => {
+                        decoder_done.store(true, Ordering::Release);
+                        active_tx.take();
+                        playback_shared.state_changed.notify_all();
+                    }
+                    Err(err) => {
+                        if let Ok(mut slot) = shared_error.lock() {
+                            *slot = Some(err);
+                        }
+                        active_tx.take();
+                        playback_shared.state_changed.notify_all();
+                        break;
+                    }
                 }
+            } else {
+                seek_coordinator.wait_while_idle(&stop_decoder, POLL_INTERVAL);
             }
         }
         decoder_done.store(true, Ordering::Release);
     })
 }
 
-fn send_chunk_or_stop(
+fn send_chunk_or_interrupt(
     tx: &SyncSender<Vec<f32>>,
     mut chunk: Vec<f32>,
     stop_decoder: &AtomicBool,
-) -> bool {
+    seek_coordinator: &SeekCoordinator,
+    generation: u64,
+) -> ChunkSendOutcome {
     loop {
         if stop_decoder.load(Ordering::Acquire) {
-            return false;
+            return ChunkSendOutcome::Stopped;
+        }
+        if seek_coordinator.is_superseded(generation) {
+            return ChunkSendOutcome::SeekRequested;
         }
         match tx.try_send(chunk) {
-            Ok(()) => return true,
+            Ok(()) => return ChunkSendOutcome::Sent,
             Err(TrySendError::Full(returned)) => {
                 chunk = returned;
                 thread::sleep(Duration::from_millis(5));
             }
-            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Disconnected(_)) => {
+                return if seek_coordinator.is_superseded(generation) {
+                    ChunkSendOutcome::SeekRequested
+                } else {
+                    ChunkSendOutcome::Stopped
+                };
+            }
         }
     }
 }
@@ -1279,8 +1673,15 @@ fn take_shared_error(shared_error: &Mutex<Option<AudioError>>) -> Option<AudioEr
     shared_error.lock().ok().and_then(|mut guard| guard.take())
 }
 
-fn join_decoder_worker(handle: JoinHandle<()>, stop_decoder: &AtomicBool) {
+fn join_decoder_worker(
+    handle: JoinHandle<()>,
+    stop_decoder: &AtomicBool,
+    seek_coordinator: Option<&SeekCoordinator>,
+) {
     stop_decoder.store(true, Ordering::Release);
+    if let Some(coord) = seek_coordinator {
+        coord.clear_requests();
+    }
     let _ = handle.join();
 }
 
@@ -1814,5 +2215,56 @@ mod tests {
 
         assert!(controller.toggle_mute());
         assert!(!controller.toggle_mute());
+    }
+
+    #[test]
+    fn controller_validates_seek_state_and_seekability_capabilities() {
+        let controller = PlaybackController::new();
+        assert!(!controller.is_seekable());
+        assert_eq!(controller.duration(), None);
+
+        // Seeking when Stopped or Loading fails with InvalidState
+        assert!(matches!(
+            controller.seek(Duration::from_secs(1)),
+            Err(AudioError::InvalidState(_))
+        ));
+        controller.begin_loading().unwrap();
+        assert!(matches!(
+            controller.seek_forward(Duration::from_secs(1)),
+            Err(AudioError::InvalidState(_))
+        ));
+
+        // Non-seekable stream rejects seeking while Playing with SeekUnsupported
+        controller.set_state_for_test(PlaybackState::Playing);
+        controller.set_seek_capabilities_for_test(SeekCapabilities {
+            is_seekable: false,
+            duration: Some(Duration::from_secs(10)),
+        });
+        assert!(matches!(
+            controller.seek(Duration::from_secs(2)),
+            Err(AudioError::SeekUnsupported(_))
+        ));
+        assert_eq!(controller.state(), PlaybackState::Playing);
+
+        // Seekable stream allows forward/backward/absolute seek during Playing & Paused
+        controller.set_seek_capabilities_for_test(SeekCapabilities {
+            is_seekable: true,
+            duration: Some(Duration::from_secs(10)),
+        });
+        assert_eq!(
+            controller.seek(Duration::from_secs(4)).unwrap(),
+            Duration::from_secs(4)
+        );
+        assert_eq!(controller.state(), PlaybackState::Seeking);
+
+        // Consecutive seek preserves original resume state and clamps to duration
+        assert_eq!(
+            controller.seek_forward(Duration::from_secs(20)).unwrap(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            controller.seek_backward(Duration::from_secs(50)).unwrap(),
+            Duration::ZERO
+        );
     }
 }

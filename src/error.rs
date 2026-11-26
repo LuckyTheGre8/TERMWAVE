@@ -68,6 +68,12 @@ mod tests {
             TermwaveError::Audio(AudioError::InvalidVolume(_))
         ));
 
+        let seek_err: TermwaveError = AudioError::SeekUnsupported("live stream".into()).into();
+        assert!(matches!(
+            seek_err,
+            TermwaveError::Audio(AudioError::SeekUnsupported(_))
+        ));
+
         let meta_err: TermwaveError = MetadataError::ReadFailed("corrupt header".into()).into();
         assert!(matches!(meta_err, TermwaveError::Metadata(_)));
 

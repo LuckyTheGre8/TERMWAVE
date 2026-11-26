@@ -4,17 +4,18 @@
 //! so local files and future network sources share the same decoding path.
 
 use std::fs::File;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Seek as _, SeekFrom};
 use std::path::Path;
 use std::time::Duration;
 
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_FLAC, CodecParameters, Decoder, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::{FormatOptions, FormatReader};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use symphonia::core::units::Time;
 
 use super::AudioError;
 
@@ -23,6 +24,18 @@ const MAX_FLAC_SAMPLE_RATE: u32 = 655_350;
 
 /// Maximum valid channel count defined by the FLAC specification.
 const MAX_FLAC_CHANNELS: usize = 8;
+
+/// Default seek jump interval (`5 seconds`).
+pub const DEFAULT_SEEK_STEP: Duration = Duration::from_secs(5);
+
+/// Explicit seeking capability descriptor for an audio source or stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SeekCapabilities {
+    /// Whether the underlying source supports seeking operations.
+    pub is_seekable: bool,
+    /// Total stream duration, if known.
+    pub duration: Option<Duration>,
+}
 
 /// Technical properties reported by the decoded source audio stream.
 ///
@@ -42,6 +55,8 @@ pub struct AudioStreamInfo {
     pub total_frames: Option<u64>,
     /// Stream duration derived from `total_frames` and `sample_rate`, if known.
     pub duration: Option<Duration>,
+    /// Whether the underlying source supports random-access seeking.
+    pub seekable: bool,
 }
 
 impl AudioStreamInfo {
@@ -54,18 +69,21 @@ impl AudioStreamInfo {
             channels: 0,
             total_frames: None,
             duration: None,
+            seekable: false,
         }
     }
 }
 
 /// Streaming FLAC decoder backed by any [`MediaSource`].
 pub struct FlacDecoder {
-    format: Box<dyn FormatReader>,
+    format: Option<Box<dyn FormatReader>>,
     decoder: Box<dyn Decoder>,
     track_id: u32,
+    extension_hint: Option<String>,
     info: AudioStreamInfo,
     sample_buf: Option<SampleBuffer<f32>>,
     decoded_frames: u64,
+    pending_skip_frames: u64,
     finished: bool,
 }
 
@@ -91,6 +109,7 @@ impl FlacDecoder {
         source: Box<dyn MediaSource>,
         extension_hint: Option<&str>,
     ) -> Result<Self, AudioError> {
+        let is_seekable = source.is_seekable();
         let mss = MediaSourceStream::new(source, Default::default());
         let mut hint = Hint::new();
         if let Some(ext) = extension_hint {
@@ -111,21 +130,56 @@ impl FlacDecoder {
         let format = probed.format;
         let track = select_flac_track(&*format)?;
         let track_id = track.id;
-        let info = extract_stream_info(&track.codec_params)?;
+        let mut info = extract_stream_info(&track.codec_params)?;
+        info.seekable = is_seekable;
 
         let decoder = symphonia::default::get_codecs()
             .make(&track.codec_params, &DecoderOptions::default())
             .map_err(map_decode_error)?;
 
         Ok(Self {
-            format,
+            format: Some(format),
             decoder,
             track_id,
+            extension_hint: extension_hint.map(str::to_owned),
             info,
             sample_buf: None,
             decoded_frames: 0,
+            pending_skip_frames: 0,
             finished: false,
         })
+    }
+
+    /// Re-opens the underlying FLAC demuxer from byte 0 so Symphonia resets any internal parser header state.
+    fn reopen_reader_at_start(&mut self) -> Result<(), AudioError> {
+        let format = self
+            .format
+            .take()
+            .ok_or_else(|| AudioError::SeekError("FLAC demuxer unavailable".to_string()))?;
+        let mut mss = format.into_inner();
+        mss.seek(SeekFrom::Start(0)).map_err(AudioError::Io)?;
+
+        let mut hint = Hint::new();
+        if let Some(ext) = &self.extension_hint {
+            hint.with_extension(ext);
+        } else {
+            hint.with_extension("flac");
+        }
+
+        let probed = symphonia::default::get_probe()
+            .format(
+                &hint,
+                mss,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
+            .map_err(map_probe_error)?;
+
+        let track = select_flac_track(&*probed.format)?;
+        self.track_id = track.id;
+        self.format = Some(probed.format);
+        self.decoder.reset();
+        Ok(())
     }
 
     /// Returns technical properties of the source FLAC stream.
@@ -133,9 +187,104 @@ impl FlacDecoder {
         &self.info
     }
 
+    /// Returns explicit seeking capabilities for this stream.
+    pub fn seek_capabilities(&self) -> SeekCapabilities {
+        SeekCapabilities {
+            is_seekable: self.info.seekable,
+            duration: self.info.duration,
+        }
+    }
+
+    /// Returns `true` if the underlying source supports seeking.
+    pub fn is_seekable(&self) -> bool {
+        self.info.seekable
+    }
+
     /// Returns the total number of audio frames (samples per channel) decoded so far.
     pub fn decoded_frames(&self) -> u64 {
         self.decoded_frames
+    }
+
+    /// Returns the current logical stream position derived from frame progress and sample rate.
+    pub fn current_position(&self) -> Duration {
+        frames_to_duration(
+            self.decoded_frames.saturating_add(self.pending_skip_frames),
+            self.info.sample_rate,
+        )
+    }
+
+    /// Seeks to an absolute `position` within the FLAC stream, returning the actual landed position.
+    ///
+    /// Returns [`AudioError::SeekUnsupported`] if the source is non-seekable.
+    pub fn seek(&mut self, position: Duration) -> Result<Duration, AudioError> {
+        if !self.info.seekable {
+            return Err(AudioError::SeekUnsupported(
+                "audio source does not support seeking".to_string(),
+            ));
+        }
+
+        let clamped = match self.info.duration {
+            Some(dur) if position > dur => dur,
+            _ => position,
+        };
+
+        let sample_rate = self.info.sample_rate;
+        let requested_frames = duration_to_frames(clamped, sample_rate);
+        let (target_ts, extra_skip) = match self.info.total_frames {
+            Some(total) if total > 0 && requested_frames >= total => (total - 1, 1_u64),
+            _ => (requested_frames, 0_u64),
+        };
+
+        // Re-opening cleanly before seeking backward or after EOF clears Symphonia's
+        // cached last-frame header state, which otherwise breaks Frame 0 re-reads.
+        if requested_frames <= self.decoded_frames || self.finished {
+            self.reopen_reader_at_start()?;
+        }
+
+        if target_ts == 0 {
+            self.decoder.reset();
+            self.finished = false;
+            self.decoded_frames = 0;
+            self.pending_skip_frames = extra_skip;
+            return Ok(self.current_position());
+        }
+
+        let target_time = duration_to_symphonia_time(frames_to_duration(target_ts, sample_rate));
+        let format = self
+            .format
+            .as_mut()
+            .ok_or_else(|| AudioError::SeekError("FLAC demuxer unavailable".to_string()))?;
+        let seeked = format
+            .seek(
+                SeekMode::Accurate,
+                SeekTo::Time {
+                    time: target_time,
+                    track_id: Some(self.track_id),
+                },
+            )
+            .map_err(map_seek_error)?;
+
+        self.decoder.reset();
+        self.finished = false;
+        self.decoded_frames = seeked.actual_ts;
+        self.pending_skip_frames = seeked
+            .required_ts
+            .saturating_sub(seeked.actual_ts)
+            .saturating_add(extra_skip);
+
+        Ok(self.current_position())
+    }
+
+    /// Seeks forward by `delta` relative to [`Self::current_position`], clamped at stream duration.
+    pub fn seek_forward(&mut self, delta: Duration) -> Result<Duration, AudioError> {
+        let target = self.current_position().saturating_add(delta);
+        self.seek(target)
+    }
+
+    /// Seeks backward by `delta` relative to [`Self::current_position`], clamped at `Duration::ZERO`.
+    pub fn seek_backward(&mut self, delta: Duration) -> Result<Duration, AudioError> {
+        let target = self.current_position().saturating_sub(delta);
+        self.seek(target)
     }
 
     /// Decodes the next FLAC frame and returns interleaved `f32` PCM samples.
@@ -147,16 +296,21 @@ impl FlacDecoder {
         }
 
         loop {
-            let packet = match self.format.next_packet() {
-                Ok(packet) => packet,
-                Err(SymphoniaError::IoError(err)) if err.kind() == ErrorKind::UnexpectedEof => {
-                    self.finished = true;
-                    self.verify_clean_eof()?;
-                    return Ok(None);
-                }
-                Err(err) => {
-                    self.finished = true;
-                    return Err(map_decode_error(err));
+            let packet = {
+                let format = self.format.as_mut().ok_or_else(|| {
+                    AudioError::DecodeError("FLAC demuxer unavailable".to_string())
+                })?;
+                match format.next_packet() {
+                    Ok(packet) => packet,
+                    Err(SymphoniaError::IoError(err)) if err.kind() == ErrorKind::UnexpectedEof => {
+                        self.finished = true;
+                        self.verify_clean_eof()?;
+                        return Ok(None);
+                    }
+                    Err(err) => {
+                        self.finished = true;
+                        return Err(map_decode_error(err));
+                    }
                 }
             };
 
@@ -191,7 +345,16 @@ impl FlacDecoder {
                 continue;
             }
 
-            self.decoded_frames = self.decoded_frames.saturating_add(frames as u64);
+            let frames_u64 = frames as u64;
+            self.decoded_frames = self.decoded_frames.saturating_add(frames_u64);
+
+            if self.pending_skip_frames >= frames_u64 {
+                self.pending_skip_frames -= frames_u64;
+                continue;
+            }
+
+            let skip_frames = usize::try_from(self.pending_skip_frames).unwrap_or(0);
+            self.pending_skip_frames = 0;
 
             let capacity = decoded.capacity() as u64;
             let needs_new_buf = match &self.sample_buf {
@@ -208,7 +371,11 @@ impl FlacDecoder {
                 .expect("sample buffer initialized above");
             buf.copy_interleaved_ref(decoded);
 
-            for &sample in buf.samples() {
+            let channels = usize::from(self.info.channels);
+            let skip_samples = skip_frames.saturating_mul(channels);
+            let samples = &buf.samples()[skip_samples..];
+
+            for &sample in samples {
                 if !sample.is_finite() {
                     self.finished = true;
                     return Err(AudioError::DecodeError(
@@ -218,7 +385,7 @@ impl FlacDecoder {
                 }
             }
 
-            return Ok(Some(buf.samples()));
+            return Ok(Some(samples));
         }
     }
 
@@ -305,11 +472,7 @@ pub(crate) fn extract_stream_info(params: &CodecParameters) -> Result<AudioStrea
     }
 
     let total_frames = params.n_frames;
-    let duration = total_frames.map(|frames| {
-        let nanos = (u128::from(frames) * 1_000_000_000) / u128::from(sample_rate);
-        let clamped = u64::try_from(nanos).unwrap_or(u64::MAX);
-        Duration::from_nanos(clamped)
-    });
+    let duration = total_frames.map(|frames| frames_to_duration(frames, sample_rate));
 
     Ok(AudioStreamInfo {
         codec: "FLAC",
@@ -318,7 +481,44 @@ pub(crate) fn extract_stream_info(params: &CodecParameters) -> Result<AudioStrea
         channels,
         total_frames,
         duration,
+        seekable: false,
     })
+}
+
+fn frames_to_duration(frames: u64, sample_rate: u32) -> Duration {
+    if sample_rate == 0 {
+        return Duration::ZERO;
+    }
+    let nanos = (u128::from(frames) * 1_000_000_000) / u128::from(sample_rate);
+    let clamped = u64::try_from(nanos).unwrap_or(u64::MAX);
+    Duration::from_nanos(clamped)
+}
+
+fn duration_to_frames(duration: Duration, sample_rate: u32) -> u64 {
+    if sample_rate == 0 {
+        return 0;
+    }
+    let frames = (duration.as_nanos() * u128::from(sample_rate)) / 1_000_000_000;
+    u64::try_from(frames).unwrap_or(u64::MAX)
+}
+
+fn duration_to_symphonia_time(duration: Duration) -> Time {
+    Time::new(
+        duration.as_secs(),
+        f64::from(duration.subsec_nanos()) / 1_000_000_000.0,
+    )
+}
+
+fn map_seek_error(err: SymphoniaError) -> AudioError {
+    match err {
+        SymphoniaError::SeekError(symphonia::core::errors::SeekErrorKind::Unseekable) => {
+            AudioError::SeekUnsupported("audio source does not support seeking".to_string())
+        }
+        SymphoniaError::SeekError(kind) => AudioError::SeekError(format!("seek failed: {kind:?}")),
+        SymphoniaError::Unsupported(msg) => AudioError::SeekUnsupported(msg.to_string()),
+        SymphoniaError::IoError(io_err) => AudioError::Io(io_err),
+        other => AudioError::SeekError(format!("seek failure: {other}")),
+    }
 }
 
 fn map_probe_error(err: SymphoniaError) -> AudioError {
@@ -454,5 +654,13 @@ mod tests {
         let garbage = Cursor::new(b"not a valid flac stream at all".to_vec());
         let err = FlacDecoder::from_source(Box::new(garbage), Some("flac"));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn converts_frames_and_durations_accurately() {
+        assert_eq!(frames_to_duration(44_100, 44_100), Duration::from_secs(1));
+        assert_eq!(duration_to_frames(Duration::from_secs(2), 96_000), 192_000);
+        assert_eq!(frames_to_duration(100, 0), Duration::ZERO);
+        assert_eq!(duration_to_frames(Duration::from_secs(1), 0), 0);
     }
 }

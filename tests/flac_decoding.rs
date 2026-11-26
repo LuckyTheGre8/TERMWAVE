@@ -185,3 +185,138 @@ fn detects_stream_truncated_before_audio_frames() {
         assert!(matches!(err, AudioError::DecodeError(_)));
     }
 }
+
+struct NonSeekableSource {
+    inner: Cursor<Vec<u8>>,
+}
+
+impl std::io::Read for NonSeekableSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Seek for NonSeekableSource {
+    fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "stream does not support seeking",
+        ))
+    }
+}
+
+impl symphonia::core::io::MediaSource for NonSeekableSource {
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        None
+    }
+}
+
+#[test]
+fn respects_source_seeking_capabilities_when_non_seekable() {
+    let bytes = fs::read(fixture_path("sine_16bit_44100_stereo.flac")).expect("read fixture bytes");
+    let mut decoder = FlacDecoder::from_source(
+        Box::new(NonSeekableSource {
+            inner: Cursor::new(bytes),
+        }),
+        Some("flac"),
+    )
+    .expect("non-seekable FLAC stream should still open and decode sequentially");
+
+    assert!(!decoder.is_seekable());
+    assert!(!decoder.seek_capabilities().is_seekable);
+    assert!(matches!(
+        decoder.seek(std::time::Duration::from_millis(20)),
+        Err(AudioError::SeekUnsupported(_))
+    ));
+    assert!(matches!(
+        decoder.seek_forward(std::time::Duration::from_millis(10)),
+        Err(AudioError::SeekUnsupported(_))
+    ));
+    assert!(matches!(
+        decoder.seek_backward(std::time::Duration::from_millis(10)),
+        Err(AudioError::SeekUnsupported(_))
+    ));
+}
+
+#[test]
+fn seeks_forward_backward_and_absolutely_across_flac_configurations() {
+    let fixtures = [
+        ("sine_16bit_44100_stereo.flac", 44_100_u32, 2_u16),
+        ("sine_24bit_48000_stereo.flac", 48_000, 2),
+        ("sine_24bit_96000_mono.flac", 96_000, 1),
+        ("sine_24bit_192000_stereo.flac", 192_000, 2),
+    ];
+
+    for (name, sample_rate, channels) in fixtures {
+        let mut decoder = FlacDecoder::open(fixture_path(name)).expect("open FLAC fixture");
+        assert!(
+            decoder.is_seekable(),
+            "{name} local file should be seekable"
+        );
+        let duration = decoder
+            .stream_info()
+            .duration
+            .expect("fixture has known duration");
+        assert!(duration >= std::time::Duration::from_millis(50));
+
+        // 1. Absolute seek to 50ms midpoint
+        let landed_mid = decoder
+            .seek(std::time::Duration::from_millis(50))
+            .unwrap_or_else(|err| panic!("absolute seek failed for {name}: {err}"));
+        assert!(
+            landed_mid >= std::time::Duration::from_millis(45)
+                && landed_mid <= std::time::Duration::from_millis(55),
+            "unexpected midpoint seek landing for {name}: {landed_mid:?}"
+        );
+
+        let (_, samples_after_mid, _) = decode_all(&mut decoder)
+            .unwrap_or_else(|err| panic!("post-seek decode failed for {name}: {err}"));
+        let remaining_frames = samples_after_mid / usize::from(channels);
+        let expected_half_frames = usize::try_from(sample_rate / 20).unwrap();
+        // Expect roughly the remaining 50ms (+/- small boundary rounding)
+        assert!(
+            remaining_frames > 0 && remaining_frames <= expected_half_frames + 64,
+            "unexpected remaining frame count for {name}: {remaining_frames} (expected ~{expected_half_frames})"
+        );
+
+        // 2. Seek backward 25ms from current end back into the stream and decode cleanly
+        let landed_back = decoder
+            .seek_backward(std::time::Duration::from_millis(25))
+            .unwrap_or_else(|err| panic!("backward seek failed for {name}: {err}"));
+        assert!(landed_back < landed_mid.saturating_add(std::time::Duration::from_millis(35)));
+        let (_, rewound_samples, _) = decode_all(&mut decoder)
+            .unwrap_or_else(|err| panic!("post-rewind decode failed for {name}: {err}"));
+        assert!(rewound_samples > 0);
+
+        // 3. Seek backward past zero clamps cleanly to Duration::ZERO
+        let at_zero = decoder
+            .seek_backward(std::time::Duration::from_secs(10))
+            .expect("clamped backward seek should succeed");
+        assert_eq!(at_zero, std::time::Duration::ZERO);
+        let (_, full_samples, _) = decode_all(&mut decoder)
+            .unwrap_or_else(|err| panic!("full decode after zero seek failed for {name}: {err}"));
+        let full_frames = full_samples / usize::from(channels);
+        assert_eq!(
+            full_frames as u64,
+            decoder.stream_info().total_frames.unwrap(),
+            "seek to 0 should replay all frames cleanly for {name}"
+        );
+
+        // 4. Seek forward clamped at stream end finishes without error
+        decoder
+            .seek(std::time::Duration::ZERO)
+            .expect("reset to zero");
+        let at_end = decoder
+            .seek_forward(std::time::Duration::from_secs(10))
+            .expect("clamped forward seek should succeed");
+        assert!(at_end <= duration);
+        let (_, tail_samples, _) = decode_all(&mut decoder).unwrap_or_else(|err| {
+            panic!("tail decode after forward clamp failed for {name}: {err}")
+        });
+        assert!(tail_samples <= usize::from(channels) * 2);
+    }
+}
