@@ -8,6 +8,7 @@
 pub mod decoder;
 pub mod output;
 pub mod playback;
+pub mod queue;
 pub mod validation;
 
 use std::fmt;
@@ -18,8 +19,9 @@ pub use decoder::{AudioStreamInfo, FlacDecoder};
 pub use output::{AudioOutput, OutputDeviceInfo, detect_default_output_device};
 pub use playback::{
     PlaybackController, PlaybackEvent, PlaybackSummary, PlaybackTrackInfo, play_local_flac,
-    play_local_flac_with_controller,
+    play_local_flac_with_controller, play_local_playlist, play_local_playlist_with_controller,
 };
+pub use queue::TrackQueue;
 pub use validation::{AudioFormat, ValidatedAudioFile, validate_audio_file};
 
 /// Clearly defined lifecycle state of the playback engine.
@@ -57,6 +59,7 @@ impl PlaybackState {
                 | (
                     Self::Playing,
                     Self::Paused
+                        | Self::Loading
                         | Self::Seeking
                         | Self::Buffering
                         | Self::Stopped
@@ -65,7 +68,7 @@ impl PlaybackState {
                 )
                 | (
                     Self::Paused,
-                    Self::Playing | Self::Seeking | Self::Stopped | Self::Error
+                    Self::Playing | Self::Loading | Self::Seeking | Self::Stopped | Self::Error
                 )
                 | (
                     Self::Buffering,

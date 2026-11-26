@@ -14,6 +14,7 @@ src/
 │   ├── validation.rs  # Local audio file existence, permission, and format validation
 │   ├── decoder.rs     # Source-agnostic Symphonia FLAC decoder and AudioStreamInfo
 │   ├── output.rs      # Encapsulated rodio/cpal system audio output initialization
+│   ├── queue.rs       # Ordered track queue, history stacks, and boundary guards
 │   └── playback.rs    # Bounded-channel decoder worker and rodio playback pipeline
 ├── metadata.rs        # Tag and embedded artwork extraction boundary
 ├── library.rs         # Music library scanning, search, and SQLite boundary
@@ -38,7 +39,8 @@ src/
 - Audio callbacks must remain non-blocking and free of disk/network I/O or UI synchronization locks.
 - State machine & playback control:
   - `PlaybackState::can_transition_to` and `PlaybackState::transition_to` enforce valid engine lifecycle transitions and reject invalid operations via `AudioError::InvalidState`.
-  - `PlaybackController` provides thread-safe `pause()`, `resume()`, `toggle_pause()`, `stop()`, active playback position tracking (preserving position across pauses and resetting to `Duration::ZERO` on stop), cancellation during loading, and immediate release of audio player, output sink, and decoder worker resources.
+  - `PlaybackController` provides thread-safe `pause()`, `resume()`, `toggle_pause()`, `stop()`, `next_track()`, `previous_track()`, bounded queue/history inspection, active playback position tracking (resetting on stop or track change), cancellation during loading, and immediate release of audio player, output sink, and decoder worker resources.
+  - `TrackQueue` (`queue.rs`) tracks current queue position, visited back-navigation stack, chronological played history (bounded to avoid unbounded memory growth), and start/end boundary guards.
 - Robust error propagation:
   - Input validation traps nonexistent, empty, non-file, unsupported, and process-locked audio files before playback begins.
   - Decoder traps corrupted headers, truncated packets, unsupported sample formats/rates, and non-finite (`NaN`/`Inf`) PCM audio samples.

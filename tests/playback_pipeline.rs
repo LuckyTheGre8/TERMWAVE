@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use termwave::audio::{
     AudioError, PlaybackController, PlaybackEvent, PlaybackState, play_local_flac,
-    play_local_flac_with_controller,
+    play_local_flac_with_controller, play_local_playlist, play_local_playlist_with_controller,
 };
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -507,4 +507,136 @@ fn supports_controller_stop_during_loading() {
     assert_eq!(controller.state(), PlaybackState::Stopped);
     assert_eq!(controller.position(), Duration::ZERO);
     assert_eq!(states, vec![PlaybackState::Loading, PlaybackState::Stopped]);
+}
+
+#[test]
+fn rejects_empty_playlist() {
+    let empty: Vec<PathBuf> = Vec::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let err = play_local_playlist(&empty, shutdown, |_| {}).unwrap_err();
+    assert!(matches!(err, AudioError::InvalidState(_)));
+}
+
+#[test]
+fn plays_playlist_tracks_sequentially_to_completion() {
+    let tracks = vec![
+        fixture_path("sine_16bit_44100_stereo.flac"),
+        fixture_path("sine_24bit_48000_stereo.flac"),
+    ];
+    let controller = PlaybackController::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut loaded_tracks = Vec::new();
+    let mut states = Vec::new();
+
+    let result =
+        play_local_playlist_with_controller(&tracks, controller.clone(), shutdown, |event| {
+            match event {
+                PlaybackEvent::TrackLoaded(info) => loaded_tracks.push(info.file.path),
+                PlaybackEvent::StateChanged(state) => states.push(state),
+            }
+        });
+
+    match result {
+        Ok(summary) => {
+            assert_eq!(summary.final_state, PlaybackState::Ended);
+            assert_eq!(loaded_tracks.len(), 2);
+            assert_eq!(controller.played_history().len(), 2);
+            assert_eq!(controller.back_history().len(), 1);
+            assert_eq!(
+                states,
+                vec![
+                    PlaybackState::Loading,
+                    PlaybackState::Playing,
+                    PlaybackState::Loading,
+                    PlaybackState::Playing,
+                    PlaybackState::Ended,
+                ]
+            );
+        }
+        Err(AudioError::NoOutputDevice) => {}
+        Err(other) => panic!("unexpected playback error: {other}"),
+    }
+}
+
+#[test]
+fn supports_next_previous_navigation_and_boundaries_during_playback() {
+    let t1 = fixture_path("sine_16bit_44100_stereo.flac");
+    let t2 = fixture_path("sine_24bit_96000_mono.flac");
+    let t3 = fixture_path("sine_24bit_192000_stereo.flac");
+    let tracks = vec![t1.clone(), t2.clone(), t3.clone()];
+
+    let controller = PlaybackController::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let loaded_tracks = Arc::new(Mutex::new(Vec::new()));
+    let (playing_tx, playing_rx) = std::sync::mpsc::sync_channel::<usize>(8);
+    let playing_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let worker_controller = controller.clone();
+    let worker_shutdown = Arc::clone(&shutdown);
+    let worker_loaded = Arc::clone(&loaded_tracks);
+    let worker_count = Arc::clone(&playing_count);
+
+    let handle = thread::spawn(move || {
+        play_local_playlist_with_controller(&tracks, worker_controller, worker_shutdown, |event| {
+            match event {
+                PlaybackEvent::TrackLoaded(info) => {
+                    worker_loaded.lock().unwrap().push(info.file.path);
+                }
+                PlaybackEvent::StateChanged(PlaybackState::Playing) => {
+                    let count = worker_count.fetch_add(1, Ordering::AcqRel) + 1;
+                    let _ = playing_tx.try_send(count);
+                }
+                PlaybackEvent::StateChanged(_) => {}
+            }
+        })
+    });
+
+    // Wait for Track 1 to start playing
+    if playing_rx.recv_timeout(Duration::from_secs(3)).is_ok() {
+        // Cannot go before track 1 (start boundary)
+        assert!(matches!(
+            controller.previous_track(),
+            Err(AudioError::InvalidState(_))
+        ));
+
+        // Skip from track 1 -> track 2
+        assert_eq!(controller.next_track().unwrap(), t2);
+        // Wait for Track 2 to enter Playing
+        let _ = playing_rx.recv_timeout(Duration::from_secs(3));
+
+        // Return from track 2 -> track 1 using playback history
+        assert_eq!(controller.previous_track().unwrap(), t1);
+        // Wait for Track 1 to re-enter Playing
+        let _ = playing_rx.recv_timeout(Duration::from_secs(3));
+
+        // Now start boundary should reject previous again
+        assert!(matches!(
+            controller.previous_track(),
+            Err(AudioError::InvalidState(_))
+        ));
+
+        // Skip forward 1 -> 2 -> 3
+        assert_eq!(controller.next_track().unwrap(), t2);
+        let _ = playing_rx.recv_timeout(Duration::from_secs(3));
+        assert_eq!(controller.next_track().unwrap(), t3);
+        let _ = playing_rx.recv_timeout(Duration::from_secs(3));
+
+        // End boundary should reject next
+        assert!(matches!(
+            controller.next_track(),
+            Err(AudioError::InvalidState(_))
+        ));
+    }
+
+    match handle.join().expect("playback thread should join cleanly") {
+        Ok(summary) => {
+            assert_eq!(summary.final_state, PlaybackState::Ended);
+            assert_eq!(
+                controller.played_history(),
+                vec![t1.clone(), t2.clone(), t1, t2, t3]
+            );
+        }
+        Err(AudioError::NoOutputDevice) => {}
+        Err(other) => panic!("unexpected playback error: {other}"),
+    }
 }

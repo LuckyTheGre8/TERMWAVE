@@ -50,9 +50,9 @@ pub enum Commands {
 /// Arguments for the `play` subcommand.
 #[derive(Debug, Args, PartialEq, Eq)]
 pub struct PlayArgs {
-    /// Path to the local audio file to play.
-    #[arg(value_name = "FILE", value_parser = parse_non_empty_path)]
-    pub file: PathBuf,
+    /// Path(s) to one or more local audio files to play sequentially.
+    #[arg(value_name = "FILE", required = true, num_args = 1.., value_parser = parse_non_empty_path)]
+    pub files: Vec<PathBuf>,
 }
 
 /// Arguments for the planned `info` subcommand.
@@ -103,14 +103,18 @@ enum PlaybackControlAction {
     TogglePause,
     Pause,
     Resume,
+    NextTrack,
+    PreviousTrack,
     Stop,
 }
 
 fn parse_playback_control_command(line: &str) -> Option<PlaybackControlAction> {
     match line.trim().to_ascii_lowercase().as_str() {
-        "" | "p" | "toggle" => Some(PlaybackControlAction::TogglePause),
+        "" | "space" | "pp" | "toggle" => Some(PlaybackControlAction::TogglePause),
         "pause" => Some(PlaybackControlAction::Pause),
         "resume" | "play" => Some(PlaybackControlAction::Resume),
+        "n" | "next" => Some(PlaybackControlAction::NextTrack),
+        "p" | "prev" | "previous" => Some(PlaybackControlAction::PreviousTrack),
         "s" | "stop" | "q" | "quit" => Some(PlaybackControlAction::Stop),
         _ => None,
     }
@@ -129,6 +133,14 @@ fn apply_playback_control_action(
         PlaybackControlAction::Resume => {
             controller.resume()?;
             Ok(PlaybackState::Playing)
+        }
+        PlaybackControlAction::NextTrack => {
+            controller.next_track()?;
+            Ok(controller.state())
+        }
+        PlaybackControlAction::PreviousTrack => {
+            controller.previous_track()?;
+            Ok(controller.state())
         }
         PlaybackControlAction::Stop => {
             controller.stop()?;
@@ -158,7 +170,7 @@ fn spawn_stdin_control_thread(controller: PlaybackController, active: Arc<Atomic
                         }
                     } else {
                         eprintln!(
-                            "Note:    unknown control '{}' (use Enter/'p' to toggle, 'pause', 'resume', 's'/'stop', or Ctrl+C to quit)",
+                            "Note:    unknown control '{}' (use Enter/'toggle', 'pause', 'resume', 'n'/'next', 'p'/'prev', 's'/'stop', or Ctrl+C to quit)",
                             line.trim()
                         );
                     }
@@ -178,7 +190,7 @@ pub fn run() -> anyhow::Result<()> {
             let controller = PlaybackController::new();
             let active = Arc::new(AtomicBool::new(true));
             spawn_stdin_control_thread(controller.clone(), Arc::clone(&active));
-            let result = execute_play(&args.file, controller, shutdown, true);
+            let result = execute_play(&args.files, controller, shutdown, true);
             active.store(false, Ordering::Release);
             result
         }
@@ -195,7 +207,7 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
 pub fn execute_with_shutdown(cli: Cli, shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
     match cli.command {
         Some(Commands::Play(args)) => {
-            execute_play(&args.file, PlaybackController::new(), shutdown, false)
+            execute_play(&args.files, PlaybackController::new(), shutdown, false)
         }
         Some(Commands::Info(_)) => {
             anyhow::bail!("the 'info' subcommand is planned for a future phase")
@@ -219,14 +231,16 @@ pub fn execute_with_shutdown(cli: Cli, shutdown: Arc<AtomicBool>) -> anyhow::Res
 }
 
 fn execute_play(
-    file: &Path,
+    files: &[PathBuf],
     controller: PlaybackController,
     shutdown: Arc<AtomicBool>,
     show_controls_hint: bool,
 ) -> anyhow::Result<()> {
     println!("{}", app_banner());
-    let summary = crate::audio::play_local_flac_with_controller(
-        file,
+    let observer = controller.clone();
+    let mut hint_printed = false;
+    let summary = crate::audio::play_local_playlist_with_controller(
+        files,
         controller,
         shutdown,
         |event| match event {
@@ -234,10 +248,15 @@ fn execute_play(
                 println!("Status:  {state}");
             }
             PlaybackEvent::TrackLoaded(info) => {
-                print_track_info(&info);
-                if show_controls_hint {
+                print_track_info(
+                    &info,
+                    observer.current_track_index(),
+                    observer.track_count(),
+                );
+                if show_controls_hint && !hint_printed {
+                    hint_printed = true;
                     println!(
-                        "Controls: press Enter/'p' to pause/resume, 's' to stop, or Ctrl+C to quit"
+                        "Controls: Enter/'toggle' pause/resume, 'n' next, 'p' previous, 's' stop, Ctrl+C quit"
                     );
                 }
             }
@@ -253,7 +272,7 @@ fn execute_play(
     Ok(())
 }
 
-fn print_track_info(info: &PlaybackTrackInfo) {
+fn print_track_info(info: &PlaybackTrackInfo, track_index: Option<usize>, track_count: usize) {
     let display_name = file_display_name(&info.file.path);
     let bit_depth = info
         .stream
@@ -264,7 +283,18 @@ fn print_track_info(info: &PlaybackTrackInfo) {
         .duration
         .map_or_else(|| "unknown".to_string(), format_duration);
 
-    println!("Track:   {display_name} ({} bytes)", info.file.size_bytes);
+    if track_count > 1
+        && let Some(idx) = track_index
+    {
+        println!(
+            "Track:   [{}/{}] {display_name} ({} bytes)",
+            idx + 1,
+            track_count,
+            info.file.size_bytes
+        );
+    } else {
+        println!("Track:   {display_name} ({} bytes)", info.file.size_bytes);
+    }
     println!(
         "Source:  {} | {} Hz | {} | {} | {}",
         info.stream.codec,
@@ -346,7 +376,15 @@ mod tests {
         assert_eq!(
             cli.command,
             Some(Commands::Play(PlayArgs {
-                file: PathBuf::from("music/sample.flac"),
+                files: vec![PathBuf::from("music/sample.flac")],
+            }))
+        );
+
+        let multi = Cli::try_parse_from(["termwave", "play", "a.flac", "b.flac"]).unwrap();
+        assert_eq!(
+            multi.command,
+            Some(Commands::Play(PlayArgs {
+                files: vec![PathBuf::from("a.flac"), PathBuf::from("b.flac")],
             }))
         );
     }
@@ -440,7 +478,7 @@ mod tests {
             Some(PlaybackControlAction::TogglePause)
         );
         assert_eq!(
-            parse_playback_control_command("  p "),
+            parse_playback_control_command("  space "),
             Some(PlaybackControlAction::TogglePause)
         );
         assert_eq!(
@@ -458,6 +496,26 @@ mod tests {
         assert_eq!(
             parse_playback_control_command("play"),
             Some(PlaybackControlAction::Resume)
+        );
+        assert_eq!(
+            parse_playback_control_command("n"),
+            Some(PlaybackControlAction::NextTrack)
+        );
+        assert_eq!(
+            parse_playback_control_command("NEXT"),
+            Some(PlaybackControlAction::NextTrack)
+        );
+        assert_eq!(
+            parse_playback_control_command("  p "),
+            Some(PlaybackControlAction::PreviousTrack)
+        );
+        assert_eq!(
+            parse_playback_control_command("prev"),
+            Some(PlaybackControlAction::PreviousTrack)
+        );
+        assert_eq!(
+            parse_playback_control_command("previous"),
+            Some(PlaybackControlAction::PreviousTrack)
         );
         assert_eq!(
             parse_playback_control_command("s"),
@@ -479,6 +537,14 @@ mod tests {
         let controller = PlaybackController::new();
         assert!(matches!(
             apply_playback_control_action(&controller, PlaybackControlAction::TogglePause),
+            Err(crate::audio::AudioError::InvalidState(_))
+        ));
+        assert!(matches!(
+            apply_playback_control_action(&controller, PlaybackControlAction::NextTrack),
+            Err(crate::audio::AudioError::InvalidState(_))
+        ));
+        assert!(matches!(
+            apply_playback_control_action(&controller, PlaybackControlAction::PreviousTrack),
             Err(crate::audio::AudioError::InvalidState(_))
         ));
         assert!(matches!(
