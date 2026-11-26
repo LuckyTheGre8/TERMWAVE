@@ -19,8 +19,9 @@ use thiserror::Error;
 pub use decoder::{AudioStreamInfo, DEFAULT_SEEK_STEP, FlacDecoder, SeekCapabilities};
 pub use output::{AudioOutput, OutputDeviceInfo, detect_default_output_device};
 pub use playback::{
-    PlaybackController, PlaybackEvent, PlaybackSummary, PlaybackTrackInfo, play_local_flac,
-    play_local_flac_with_controller, play_local_playlist, play_local_playlist_with_controller,
+    PlaybackController, PlaybackEvent, PlaybackSnapshot, PlaybackSummary, PlaybackTrackInfo,
+    play_local_flac, play_local_flac_with_controller, play_local_playlist,
+    play_local_playlist_with_controller,
 };
 pub use queue::TrackQueue;
 pub use validation::{AudioFormat, ValidatedAudioFile, validate_audio_file};

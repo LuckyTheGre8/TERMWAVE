@@ -24,8 +24,47 @@ use super::{
 /// Maximum number of decoded PCM packet buffers kept in flight.
 const PACKET_CHANNEL_CAPACITY: usize = 16;
 
+/// Bounded per-subscriber queue depth for non-blocking state change updates.
+const SUBSCRIBER_CHANNEL_CAPACITY: usize = 64;
+
 /// Polling interval while waiting for playback completion or shutdown.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Consistent point-in-time snapshot of centralized playback state.
+///
+/// Captured atomically under a single controller lock so CLI, TUI, and status
+/// observers remain synchronized without torn reads or race conditions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaybackSnapshot {
+    /// Monotonically increasing revision bumped on every centralized state change.
+    pub revision: u64,
+    /// Current playback lifecycle state.
+    pub state: PlaybackState,
+    /// Loaded track, source stream, and active audio device metadata, if available.
+    pub track: Option<PlaybackTrackInfo>,
+    /// Current position within the active track.
+    pub position: Duration,
+    /// Total duration of the active track, if known.
+    pub duration: Option<Duration>,
+    /// Whether the active track source supports seeking.
+    pub is_seekable: bool,
+    /// Configured volume level (`0.0..=1.0`), independent of mute state.
+    pub volume: f32,
+    /// Configured volume percentage (`0..=100`).
+    pub volume_percent: u8,
+    /// Whether audio output is currently muted.
+    pub muted: bool,
+    /// 0-based index of the active track in the playback queue, if any.
+    pub track_index: Option<usize>,
+    /// Total number of tracks in the active queue.
+    pub track_count: usize,
+    /// Whether a subsequent track exists in the queue.
+    pub has_next: bool,
+    /// Whether navigating to a previous track is possible.
+    pub has_previous: bool,
+    /// Error description recorded when playback enters [`PlaybackState::Error`].
+    pub last_error: Option<String>,
+}
 
 /// Thread-safe playback control and state handle.
 ///
@@ -45,9 +84,12 @@ struct PlaybackShared {
 
 #[derive(Default)]
 struct ControllerInner {
+    revision: u64,
     state: PlaybackState,
     player: Option<Player>,
     queue: Option<TrackQueue>,
+    track_info: Option<PlaybackTrackInfo>,
+    last_error: Option<String>,
     volume: VolumeState,
     seek_capabilities: SeekCapabilities,
     seek_coordinator: Option<Arc<SeekCoordinator>>,
@@ -60,6 +102,7 @@ struct ControllerInner {
     total_session_elapsed: Duration,
     last_stopped_elapsed: Duration,
     pending_events: VecDeque<PlaybackState>,
+    subscribers: Vec<SyncSender<PlaybackSnapshot>>,
 }
 
 #[derive(Default)]
@@ -135,6 +178,14 @@ impl SeekCoordinator {
             return None;
         }
         guard.ready_seek.take()
+    }
+
+    fn has_ready_seek(&self) -> bool {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.pending_seek.is_none() && guard.ready_seek.is_some()
     }
 
     fn clear_requests(&self) {
@@ -250,6 +301,8 @@ impl ControllerInner {
         }
 
         self.stop_requested = true;
+        self.track_info = None;
+        self.last_error = None;
         if let Some(signal) = &self.stop_signal {
             signal.store(true, Ordering::Release);
         }
@@ -289,6 +342,8 @@ impl ControllerInner {
 
         let _ = self.pause_active_timer();
         self.accumulated_elapsed = Duration::ZERO;
+        self.track_info = None;
+        self.last_error = None;
         self.seek_capabilities = SeekCapabilities::default();
         if let Some(coord) = &self.seek_coordinator {
             coord.clear_requests();
@@ -367,6 +422,44 @@ impl ControllerInner {
             player.set_volume(self.volume.effective_level());
         }
     }
+
+    fn current_position(&self) -> Duration {
+        let current_span = self.active_since.map_or(Duration::ZERO, |t| t.elapsed());
+        self.accumulated_elapsed + current_span
+    }
+
+    fn snapshot(&self) -> PlaybackSnapshot {
+        PlaybackSnapshot {
+            revision: self.revision,
+            state: self.state,
+            track: self.track_info.clone(),
+            position: self.current_position(),
+            duration: self.seek_capabilities.duration,
+            is_seekable: self.seek_capabilities.is_seekable,
+            volume: self.volume.level(),
+            volume_percent: self.volume.percent(),
+            muted: self.volume.is_muted(),
+            track_index: self.queue.as_ref().and_then(TrackQueue::current_index),
+            track_count: self.queue.as_ref().map_or(0, TrackQueue::len),
+            has_next: self.queue.as_ref().is_some_and(TrackQueue::has_next),
+            has_previous: self.queue.as_ref().is_some_and(TrackQueue::has_previous),
+            last_error: self.last_error.clone(),
+        }
+    }
+
+    fn commit_state_change(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+        if self.subscribers.is_empty() {
+            return;
+        }
+        let snapshot = self.snapshot();
+        self.subscribers.retain(|tx| {
+            !matches!(
+                tx.try_send(snapshot.clone()),
+                Err(TrySendError::Disconnected(_))
+            )
+        });
+    }
 }
 
 impl PlaybackController {
@@ -378,6 +471,52 @@ impl PlaybackController {
     /// Returns the current [`PlaybackState`].
     pub fn state(&self) -> PlaybackState {
         self.lock_inner().state
+    }
+
+    /// Returns a consistent atomic snapshot of the full centralized playback state.
+    pub fn snapshot(&self) -> PlaybackSnapshot {
+        self.lock_inner().snapshot()
+    }
+
+    /// Returns the current monotonically increasing state revision number.
+    pub fn revision(&self) -> u64 {
+        self.lock_inner().revision
+    }
+
+    /// Returns the loaded track, source stream, and audio device metadata, if available.
+    pub fn current_track_info(&self) -> Option<PlaybackTrackInfo> {
+        self.lock_inner().track_info.clone()
+    }
+
+    /// Returns the most recent playback error message when halted by a failure.
+    pub fn last_error(&self) -> Option<String> {
+        self.lock_inner().last_error.clone()
+    }
+
+    /// Subscribes an application component to centralized playback state snapshots.
+    ///
+    /// Subscribers receive ordered updates over a bounded non-blocking channel so
+    /// slow observers never stall audio callbacks or decoding.
+    pub fn subscribe(&self) -> Receiver<PlaybackSnapshot> {
+        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let mut inner = self.lock_inner();
+        inner.subscribers.push(tx);
+        rx
+    }
+
+    /// Blocks until the centralized state revision advances past `seen_revision`
+    /// or `timeout` elapses, returning the latest [`PlaybackSnapshot`].
+    pub fn wait_for_update(&self, seen_revision: u64, timeout: Duration) -> PlaybackSnapshot {
+        let mut inner = self.lock_inner();
+        if inner.revision == seen_revision {
+            let (guard, _) = self
+                .shared
+                .state_changed
+                .wait_timeout_while(inner, timeout, |st| st.revision == seen_revision)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inner = guard;
+        }
+        inner.snapshot()
     }
 
     /// Returns `true` if playback is currently [`PlaybackState::Playing`].
@@ -413,7 +552,7 @@ impl PlaybackController {
     pub fn pause(&self) -> Result<(), AudioError> {
         let mut inner = self.lock_inner();
         inner.apply_pause()?;
-        self.shared.state_changed.notify_all();
+        self.commit_and_notify(inner);
         Ok(())
     }
 
@@ -423,7 +562,7 @@ impl PlaybackController {
     pub fn resume(&self) -> Result<(), AudioError> {
         let mut inner = self.lock_inner();
         inner.apply_resume()?;
-        self.shared.state_changed.notify_all();
+        self.commit_and_notify(inner);
         Ok(())
     }
 
@@ -448,7 +587,7 @@ impl PlaybackController {
                 )));
             }
         };
-        self.shared.state_changed.notify_all();
+        self.commit_and_notify(inner);
         Ok(next)
     }
 
@@ -458,7 +597,7 @@ impl PlaybackController {
     pub fn stop(&self) -> Result<(), AudioError> {
         let mut inner = self.lock_inner();
         inner.apply_stop()?;
-        self.shared.state_changed.notify_all();
+        self.commit_and_notify(inner);
         Ok(())
     }
 
@@ -469,7 +608,7 @@ impl PlaybackController {
     pub fn next_track(&self) -> Result<PathBuf, AudioError> {
         let mut inner = self.lock_inner();
         let path = inner.apply_navigation(TrackNavigationDirection::Next)?;
-        self.shared.state_changed.notify_all();
+        self.commit_and_notify(inner);
         Ok(path)
     }
 
@@ -480,7 +619,7 @@ impl PlaybackController {
     pub fn previous_track(&self) -> Result<PathBuf, AudioError> {
         let mut inner = self.lock_inner();
         let path = inner.apply_navigation(TrackNavigationDirection::Previous)?;
-        self.shared.state_changed.notify_all();
+        self.commit_and_notify(inner);
         Ok(path)
     }
 
@@ -565,6 +704,7 @@ impl PlaybackController {
         let mut inner = self.lock_inner();
         let updated = inner.volume.set_level(level)?;
         inner.apply_player_volume();
+        self.commit_and_notify(inner);
         Ok(updated)
     }
 
@@ -573,6 +713,7 @@ impl PlaybackController {
         let mut inner = self.lock_inner();
         let updated = inner.volume.set_percent(percent)?;
         inner.apply_player_volume();
+        self.commit_and_notify(inner);
         Ok(updated)
     }
 
@@ -583,6 +724,7 @@ impl PlaybackController {
         let mut inner = self.lock_inner();
         let updated = inner.volume.adjust(delta)?;
         inner.apply_player_volume();
+        self.commit_and_notify(inner);
         Ok(updated)
     }
 
@@ -603,6 +745,7 @@ impl PlaybackController {
         let mut inner = self.lock_inner();
         inner.volume.mute();
         inner.apply_player_volume();
+        self.commit_and_notify(inner);
     }
 
     /// Unmutes playback and restores output at the configured volume level.
@@ -610,6 +753,7 @@ impl PlaybackController {
         let mut inner = self.lock_inner();
         inner.volume.unmute();
         inner.apply_player_volume();
+        self.commit_and_notify(inner);
     }
 
     /// Toggles mute status and returns the resulting muted state (`true` if muted).
@@ -617,6 +761,7 @@ impl PlaybackController {
         let mut inner = self.lock_inner();
         let muted = inner.volume.toggle_mute();
         inner.apply_player_volume();
+        self.commit_and_notify(inner);
         muted
     }
 
@@ -642,7 +787,7 @@ impl PlaybackController {
     pub fn seek(&self, position: Duration) -> Result<Duration, AudioError> {
         let mut inner = self.lock_inner();
         let landed = inner.apply_seek(position)?;
-        self.shared.state_changed.notify_all();
+        self.commit_and_notify(inner);
         Ok(landed)
     }
 
@@ -654,7 +799,7 @@ impl PlaybackController {
         let current =
             inner.accumulated_elapsed + inner.active_since.map_or(Duration::ZERO, |t| t.elapsed());
         let landed = inner.apply_seek(current.saturating_add(delta))?;
-        self.shared.state_changed.notify_all();
+        self.commit_and_notify(inner);
         Ok(landed)
     }
 
@@ -666,7 +811,7 @@ impl PlaybackController {
         let current =
             inner.accumulated_elapsed + inner.active_since.map_or(Duration::ZERO, |t| t.elapsed());
         let landed = inner.apply_seek(current.saturating_sub(delta))?;
-        self.shared.state_changed.notify_all();
+        self.commit_and_notify(inner);
         Ok(landed)
     }
 
@@ -675,6 +820,12 @@ impl PlaybackController {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn commit_and_notify(&self, mut inner: std::sync::MutexGuard<'_, ControllerInner>) {
+        inner.commit_state_change();
+        drop(inner);
+        self.shared.state_changed.notify_all();
     }
 
     #[cfg(test)]
@@ -705,6 +856,8 @@ impl PlaybackController {
         inner.state.transition_to(PlaybackState::Loading)?;
         inner.player = None;
         inner.queue = Some(queue);
+        inner.track_info = None;
+        inner.last_error = None;
         inner.seek_capabilities = SeekCapabilities::default();
         inner.seek_coordinator = None;
         inner.resume_after_seek = PlaybackState::Stopped;
@@ -716,12 +869,20 @@ impl PlaybackController {
         inner.total_session_elapsed = Duration::ZERO;
         inner.last_stopped_elapsed = Duration::ZERO;
         inner.pending_events.clear();
+        self.commit_and_notify(inner);
         Ok(())
     }
 
     #[cfg(test)]
     fn begin_loading(&self) -> Result<(), AudioError> {
         self.begin_loading_with_queue(TrackQueue::new(Vec::new()))
+    }
+
+    fn set_loaded_track(&self, info: PlaybackTrackInfo) {
+        let mut inner = self.lock_inner();
+        inner.track_info = Some(info);
+        inner.last_error = None;
+        self.commit_and_notify(inner);
     }
 
     fn set_track_seek_context(
@@ -732,6 +893,7 @@ impl PlaybackController {
         let mut inner = self.lock_inner();
         inner.seek_capabilities = capabilities;
         inner.seek_coordinator = Some(coordinator);
+        self.commit_and_notify(inner);
     }
 
     fn complete_ready_seek_if_any(
@@ -793,7 +955,7 @@ impl PlaybackController {
         };
         let _ = inner.state.transition_to(target_state);
         inner.pending_events.push_back(target_state);
-        self.shared.state_changed.notify_all();
+        self.commit_and_notify(inner);
         Some(ready.decoder_done)
     }
 
@@ -843,9 +1005,10 @@ impl PlaybackController {
         inner.state.transition_to(PlaybackState::Playing)?;
         player.set_volume(inner.volume.effective_level());
         inner.player = Some(player);
+        inner.last_error = None;
         inner.accumulated_elapsed = Duration::ZERO;
         inner.active_since = Some(Instant::now());
-        self.shared.state_changed.notify_all();
+        self.commit_and_notify(inner);
         Ok(true)
     }
 
@@ -892,14 +1055,16 @@ impl PlaybackController {
             .is_some_and(|queue| queue.advance_next().is_ok())
         {
             inner.accumulated_elapsed = Duration::ZERO;
+            inner.track_info = None;
+            inner.last_error = None;
             let _ = inner.state.transition_to(PlaybackState::Loading);
-            self.shared.state_changed.notify_all();
+            self.commit_and_notify(inner);
             return TrackEndOutcome::NextTrack;
         }
 
         let total_elapsed = inner.total_session_elapsed;
         let _ = inner.state.transition_to(PlaybackState::Ended);
-        self.shared.state_changed.notify_all();
+        self.commit_and_notify(inner);
         TrackEndOutcome::Ended(total_elapsed)
     }
 
@@ -921,11 +1086,12 @@ impl PlaybackController {
         if let Some(coord) = inner.seek_coordinator.take() {
             coord.clear_requests();
         }
-        self.shared.state_changed.notify_all();
-        inner.last_stopped_elapsed
+        let elapsed = inner.last_stopped_elapsed;
+        self.commit_and_notify(inner);
+        elapsed
     }
 
-    fn fail_active(&self) {
+    fn fail_active(&self, reason: impl Into<String>) {
         let mut inner = self.lock_inner();
         let _ = inner.pause_active_timer();
         if let Some(player) = inner.player.take() {
@@ -938,13 +1104,21 @@ impl PlaybackController {
         if let Some(coord) = inner.seek_coordinator.take() {
             coord.clear_requests();
         }
+        inner.last_error = Some(reason.into());
         let _ = inner.state.transition_to(PlaybackState::Error);
-        self.shared.state_changed.notify_all();
+        self.commit_and_notify(inner);
     }
 
     fn wait_poll_or_event(&self, timeout: Duration) {
         let inner = self.lock_inner();
-        if inner.pending_events.is_empty() && !inner.stop_requested && !inner.track_switch_requested
+        let has_ready_seek = inner
+            .seek_coordinator
+            .as_ref()
+            .is_some_and(|coord| coord.has_ready_seek());
+        if inner.pending_events.is_empty()
+            && !inner.stop_requested
+            && !inner.track_switch_requested
+            && !has_ready_seek
         {
             let _ = self.shared.state_changed.wait_timeout(inner, timeout);
         }
@@ -1207,11 +1381,13 @@ fn play_single_queue_track(
         return Ok(TrackWaitOutcome::SwitchTrack);
     }
 
-    on_event(PlaybackEvent::TrackLoaded(PlaybackTrackInfo {
+    let track_info = PlaybackTrackInfo {
         file: validated,
         stream: stream_info.clone(),
         output: output_info.clone(),
-    }));
+    };
+    controller.set_loaded_track(track_info.clone());
+    on_event(PlaybackEvent::TrackLoaded(track_info));
 
     let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(PACKET_CHANNEL_CAPACITY);
     let stop_decoder = Arc::new(AtomicBool::new(false));
@@ -1275,7 +1451,7 @@ fn play_single_queue_track(
             )));
         }
         Err(err) => {
-            controller.fail_active();
+            controller.fail_active(err.to_string());
             drop(output);
             join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
             on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
@@ -1314,7 +1490,7 @@ fn play_single_queue_track(
             )));
         }
         Err(err) => {
-            controller.fail_active();
+            controller.fail_active(err.to_string());
             drop(output);
             join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
             on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
@@ -1384,7 +1560,7 @@ fn wait_for_playback(
         }
 
         if let Some(err) = take_shared_error(&shared_error) {
-            controller.fail_active();
+            controller.fail_active(err.to_string());
             drop(output);
             join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
             controller.drain_pending_events(on_event);
@@ -1424,7 +1600,7 @@ fn wait_for_playback(
             }
 
             if let Some(err) = take_shared_error(&shared_error) {
-                controller.fail_active();
+                controller.fail_active(err.to_string());
                 drop(output);
                 join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
                 on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
@@ -1466,7 +1642,7 @@ fn fail_and_emit(
     err: AudioError,
     on_event: &mut impl FnMut(PlaybackEvent),
 ) -> AudioError {
-    controller.fail_active();
+    controller.fail_active(err.to_string());
     on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
     err
 }
@@ -2266,5 +2442,71 @@ mod tests {
             controller.seek_backward(Duration::from_secs(50)).unwrap(),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn controller_tracks_centralized_snapshot_revisions_subscribers_and_errors() {
+        let controller = PlaybackController::new();
+        let initial = controller.snapshot();
+        assert_eq!(initial.revision, 0);
+        assert_eq!(initial.state, PlaybackState::Stopped);
+        assert_eq!(initial.last_error, None);
+        assert!(initial.track.is_none());
+
+        let rx1 = controller.subscribe();
+        let rx2 = controller.subscribe();
+
+        controller
+            .begin_loading_with_queue(TrackQueue::new(vec![
+                PathBuf::from("a.flac"),
+                PathBuf::from("b.flac"),
+            ]))
+            .unwrap();
+        let snap1 = rx1.recv_timeout(Duration::from_secs(1)).unwrap();
+        let snap2 = rx2.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(snap1, snap2);
+        assert_eq!(snap1.revision, 1);
+        assert_eq!(snap1.state, PlaybackState::Loading);
+        assert_eq!(snap1.track_index, Some(0));
+        assert_eq!(snap1.track_count, 2);
+        assert!(snap1.has_next);
+        assert!(!snap1.has_previous);
+
+        // Drop one subscriber; remaining subscriber still receives monotonic updates.
+        drop(rx2);
+        controller.set_volume_percent(42).unwrap();
+        let snap_vol = rx1.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(snap_vol.revision, 2);
+        assert_eq!(snap_vol.volume_percent, 42);
+
+        // Error state records human-readable reason and clears on subsequent load.
+        controller.fail_active("simulated decoder failure");
+        let snap_err = rx1.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(snap_err.revision, 3);
+        assert_eq!(snap_err.state, PlaybackState::Error);
+        assert_eq!(
+            snap_err.last_error.as_deref(),
+            Some("simulated decoder failure")
+        );
+        assert_eq!(
+            controller.last_error().as_deref(),
+            Some("simulated decoder failure")
+        );
+
+        controller.begin_loading().unwrap();
+        let snap_reload = rx1.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(snap_reload.revision, 4);
+        assert_eq!(snap_reload.state, PlaybackState::Loading);
+        assert_eq!(snap_reload.last_error, None);
+
+        // wait_for_update wakes immediately when unseen update occurs from another thread.
+        let waiter = controller.clone();
+        let seen = snap_reload.revision;
+        let handle = thread::spawn(move || waiter.wait_for_update(seen, Duration::from_secs(2)));
+        thread::sleep(Duration::from_millis(20));
+        controller.mute();
+        let awaited = handle.join().unwrap();
+        assert_eq!(awaited.revision, 5);
+        assert!(awaited.muted);
     }
 }

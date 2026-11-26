@@ -123,6 +123,7 @@ enum PlaybackControlAction {
     SetVolume(String),
     ToggleMute,
     Unmute,
+    ShowStatus,
     Stop,
 }
 
@@ -151,6 +152,7 @@ fn parse_playback_control_command(line: &str) -> Option<PlaybackControlAction> {
         "-" | "down" | "vol-" => Some(PlaybackControlAction::VolumeDown),
         "m" | "mute" => Some(PlaybackControlAction::ToggleMute),
         "unmute" => Some(PlaybackControlAction::Unmute),
+        "status" | "st" => Some(PlaybackControlAction::ShowStatus),
         "s" | "stop" | "q" | "quit" => Some(PlaybackControlAction::Stop),
         _ => None,
     }
@@ -257,6 +259,7 @@ fn apply_playback_control_action(
             controller.unmute();
             Ok(controller.state())
         }
+        PlaybackControlAction::ShowStatus => Ok(controller.snapshot().state),
         PlaybackControlAction::Stop => {
             controller.stop()?;
             Ok(PlaybackState::Stopped)
@@ -286,7 +289,11 @@ fn spawn_stdin_control_thread(controller: PlaybackController, active: Arc<Atomic
                                 | PlaybackControlAction::ToggleMute
                                 | PlaybackControlAction::Unmute
                         );
+                        let is_status_action = matches!(action, PlaybackControlAction::ShowStatus);
                         match apply_playback_control_action(&controller, &action) {
+                            Ok(_) if is_status_action => {
+                                print_snapshot_status(&controller.snapshot());
+                            }
                             Ok(PlaybackState::Stopped) => break,
                             Ok(_) if is_volume_action => {
                                 if controller.is_muted() {
@@ -300,7 +307,7 @@ fn spawn_stdin_control_thread(controller: PlaybackController, active: Arc<Atomic
                         }
                     } else {
                         eprintln!(
-                            "Note:    unknown control '{}' (Enter/'toggle', 'n'/'p', 'f'/'b'/'seek <t>', '+'/'-'/'m', 's', Ctrl+C)",
+                            "Note:    unknown control '{}' (Enter/'toggle', 'n'/'p', 'f'/'b'/'seek <t>', '+'/'-'/'m', 'status', 's', Ctrl+C)",
                             line.trim()
                         );
                     }
@@ -391,7 +398,7 @@ fn execute_play(
                 if show_controls_hint && !hint_printed {
                     hint_printed = true;
                     println!(
-                        "Controls: Enter/'toggle' pause, 'n'/'p' track, 'f'/'b'/'seek <t>' seek, '+'/'-'/'m' vol, 's' stop, Ctrl+C"
+                        "Controls: Enter/'toggle' pause, 'n'/'p' track, 'f'/'b'/'seek <t>' seek, '+'/'-'/'m' vol, 'status', 's' stop, Ctrl+C"
                     );
                 }
             }
@@ -442,6 +449,36 @@ fn print_track_info(info: &PlaybackTrackInfo, track_index: Option<usize>, track_
         "Output:  {} | {} Hz | {} ch | {}",
         info.output.name, info.output.sample_rate, info.output.channels, info.output.sample_format
     );
+}
+
+fn print_snapshot_status(snapshot: &crate::audio::PlaybackSnapshot) {
+    let track_label = snapshot.track.as_ref().map_or_else(
+        || "none".to_string(),
+        |info| file_display_name(&info.file.path),
+    );
+    let total = snapshot
+        .duration
+        .map_or_else(|| "unknown".to_string(), format_duration);
+    let volume_label = if snapshot.muted {
+        format!("{}% (muted)", snapshot.volume_percent)
+    } else {
+        format!("{}%", snapshot.volume_percent)
+    };
+    let queue_label = match (snapshot.track_index, snapshot.track_count) {
+        (Some(idx), count) if count > 1 => format!(" [{}/{}]", idx + 1, count),
+        _ => String::new(),
+    };
+    println!(
+        "Status:  {} | {}/{} | Vol {} | {track_label}{queue_label} (rev {})",
+        snapshot.state,
+        format_duration(snapshot.position),
+        total,
+        volume_label,
+        snapshot.revision,
+    );
+    if let Some(err) = &snapshot.last_error {
+        println!("Error:   {err}");
+    }
 }
 
 fn file_display_name(path: &Path) -> String {
@@ -762,6 +799,18 @@ mod tests {
         assert_eq!(controller.volume_percent(), 50);
         apply_playback_control_action(&controller, &PlaybackControlAction::ToggleMute).unwrap();
         assert!(controller.is_muted());
+        assert_eq!(
+            apply_playback_control_action(&controller, &PlaybackControlAction::ShowStatus).unwrap(),
+            PlaybackState::Stopped
+        );
+        assert_eq!(
+            parse_playback_control_command("status"),
+            Some(PlaybackControlAction::ShowStatus)
+        );
+        assert_eq!(
+            parse_playback_control_command("st"),
+            Some(PlaybackControlAction::ShowStatus)
+        );
         assert!(matches!(
             apply_playback_control_action(
                 &controller,

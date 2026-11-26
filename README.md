@@ -11,7 +11,7 @@ Termwave is a lightweight, cross-platform, lossless-first terminal Hi-Fi music p
 
 ## Status
 
-Currently at **Phase 13 (Seeking)** in Stage 2 (Playback Engine) of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play` supports forward, backward, and absolute seeking across FLAC sample rates/bit depths (`FlacDecoder::seek`, `seek_forward`, `seek_backward`), explicit source `SeekCapabilities` enforcement, seeking while both `Playing` and `Paused` (preserving pause state via `PlaybackController` and performing all I/O off the audio callback), alongside playlist navigation, validated volume/mute controls with clipping prevention, and interactive terminal controls. Centralized state tracking follows in Phase 14.
+Currently at **Phase 14 (Playback state tracking)** in Stage 2 (Playback Engine) of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play` provides centralized playback state synchronization (`PlaybackSnapshot`, monotonic state revisions, non-blocking bounded `subscribe()` streams, `wait_for_update()`, active track completion tracking, and synchronized `last_error` reporting across components), alongside forward/backward/absolute FLAC seeking, playlist navigation, validated volume/mute controls with clipping prevention, and interactive terminal controls (including `status`). Gapless playback groundwork follows in Phase 15.
 
 ## Usage
 

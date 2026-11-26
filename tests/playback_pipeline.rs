@@ -776,3 +776,208 @@ fn supports_seeking_during_playback_and_pause() {
         Err(other) => panic!("unexpected playback error: {other}"),
     }
 }
+
+#[test]
+fn synchronizes_centralized_state_across_subscribers_until_completion() {
+    let tracks = vec![
+        fixture_path("sine_16bit_44100_stereo.flac"),
+        fixture_path("sine_24bit_48000_stereo.flac"),
+    ];
+    let controller = PlaybackController::new();
+    let rx_ui = controller.subscribe();
+    let rx_observer = controller.subscribe();
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    let watcher_ctrl = controller.clone();
+    let waiter = thread::spawn(move || {
+        let mut seen = 0;
+        let mut observed_states = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let snap = watcher_ctrl.wait_for_update(seen, Duration::from_millis(250));
+            if snap.revision > seen {
+                seen = snap.revision;
+                observed_states.push(snap.state);
+                if matches!(snap.state, PlaybackState::Ended | PlaybackState::Error) {
+                    break;
+                }
+            }
+        }
+        observed_states
+    });
+
+    let result = play_local_playlist_with_controller(&tracks, controller.clone(), shutdown, |_| {});
+    let waited_states = waiter.join().expect("state waiter thread should join");
+
+    let mut ui_snapshots = Vec::new();
+    while let Ok(snap) = rx_ui.try_recv() {
+        ui_snapshots.push(snap);
+    }
+    let mut observer_snapshots = Vec::new();
+    while let Ok(snap) = rx_observer.try_recv() {
+        observer_snapshots.push(snap);
+    }
+
+    // Both subscribers always receive strictly matching ordered snapshot streams.
+    assert_eq!(ui_snapshots, observer_snapshots);
+    for pair in ui_snapshots.windows(2) {
+        assert!(pair[0].revision < pair[1].revision);
+    }
+
+    match result {
+        Ok(summary) => {
+            assert_eq!(summary.final_state, PlaybackState::Ended);
+            let final_snapshot = controller.snapshot();
+            assert_eq!(final_snapshot.state, PlaybackState::Ended);
+            assert_eq!(final_snapshot.last_error, None);
+            assert_eq!(final_snapshot.track_index, Some(1));
+            assert_eq!(final_snapshot.track_count, 2);
+            assert!(!final_snapshot.has_next);
+            assert!(final_snapshot.has_previous);
+            assert!(final_snapshot.track.is_some());
+            assert_eq!(
+                ui_snapshots.last().map(|s| s.state),
+                Some(PlaybackState::Ended)
+            );
+            assert!(waited_states.contains(&PlaybackState::Playing));
+            assert_eq!(waited_states.last(), Some(&PlaybackState::Ended));
+        }
+        Err(AudioError::NoOutputDevice) => {
+            assert_eq!(controller.state(), PlaybackState::Error);
+            assert!(controller.last_error().is_some());
+        }
+        Err(other) => panic!("unexpected playback error: {other}"),
+    }
+}
+
+#[test]
+fn records_centralized_error_state_and_recovers_on_subsequent_playback() {
+    let controller = PlaybackController::new();
+    let rx = controller.subscribe();
+    let temp_dir = std::env::temp_dir().join("termwave_phase14_error_sync_test");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let corrupt_flac = temp_dir.join("broken.flac");
+    fs::write(&corrupt_flac, b"fLaCnot_valid_frames_at_all").unwrap();
+
+    let err = play_local_flac_with_controller(
+        &corrupt_flac,
+        controller.clone(),
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .expect_err("corrupt FLAC should fail playback");
+    let err_msg = err.to_string();
+
+    let snap = controller.snapshot();
+    assert_eq!(snap.state, PlaybackState::Error);
+    assert_eq!(snap.last_error.as_deref(), Some(err_msg.as_str()));
+
+    let mut received_states = Vec::new();
+    while let Ok(s) = rx.try_recv() {
+        received_states.push(s);
+    }
+    assert_eq!(
+        received_states.last().map(|s| s.state),
+        Some(PlaybackState::Error)
+    );
+    assert_eq!(
+        received_states.last().and_then(|s| s.last_error.as_deref()),
+        Some(err_msg.as_str())
+    );
+
+    // Subsequent valid load must clear last_error and transition cleanly from Error -> Loading.
+    let valid_res = play_local_flac_with_controller(
+        fixture_path("sine_16bit_44100_stereo.flac"),
+        controller.clone(),
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+    );
+    match valid_res {
+        Ok(summary) => {
+            assert_eq!(summary.final_state, PlaybackState::Ended);
+            assert_eq!(controller.last_error(), None);
+            assert_eq!(controller.state(), PlaybackState::Ended);
+        }
+        Err(AudioError::NoOutputDevice) => {
+            assert_eq!(controller.state(), PlaybackState::Error);
+            assert!(controller.last_error().is_some());
+        }
+        Err(other) => panic!("unexpected playback error: {other}"),
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn concurrent_state_readers_and_controls_remain_race_free() {
+    let controller = PlaybackController::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let (playing_tx, playing_rx) = std::sync::mpsc::sync_channel::<()>(4);
+
+    let worker_ctrl = controller.clone();
+    let worker_shutdown = Arc::clone(&shutdown);
+    let playback_handle = thread::spawn(move || {
+        play_local_flac_with_controller(
+            fixture_path("sine_24bit_192000_stereo.flac"),
+            worker_ctrl,
+            worker_shutdown,
+            |event| {
+                if let PlaybackEvent::StateChanged(PlaybackState::Playing) = event {
+                    let _ = playing_tx.try_send(());
+                }
+            },
+        )
+    });
+
+    // Spawn concurrent snapshot/subscription observers while controls mutate state.
+    let mut readers = Vec::new();
+    for _ in 0..3 {
+        let reader_ctrl = controller.clone();
+        let reader_done = Arc::clone(&done);
+        let reader_rx = controller.subscribe();
+        readers.push(thread::spawn(move || {
+            let mut last_rev = 0;
+            while !reader_done.load(Ordering::Acquire) {
+                let snap = reader_ctrl.snapshot();
+                assert!(snap.revision >= last_rev);
+                last_rev = snap.revision;
+                while let Ok(sub_snap) = reader_rx.try_recv() {
+                    assert!(sub_snap.revision <= reader_ctrl.revision());
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }));
+    }
+
+    if playing_rx.recv_timeout(Duration::from_secs(3)).is_ok() {
+        controller.pause().unwrap();
+        controller.set_volume_percent(75).unwrap();
+        let seek_rev_before = controller.revision();
+        let _ = controller.seek(Duration::from_millis(30)).unwrap();
+
+        // Wait via centralized state tracking for seek to settle back to Paused before resuming.
+        let mut seen = seek_rev_before;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let snap = controller.wait_for_update(seen, Duration::from_millis(100));
+            seen = snap.revision;
+            if snap.state == PlaybackState::Paused {
+                break;
+            }
+        }
+        controller.resume().unwrap();
+    }
+
+    let result = playback_handle.join().expect("playback thread should join");
+    done.store(true, Ordering::Release);
+    for reader in readers {
+        reader.join().expect("reader thread should join cleanly");
+    }
+
+    match result {
+        Ok(summary) => assert_eq!(summary.final_state, PlaybackState::Ended),
+        Err(AudioError::NoOutputDevice) => {}
+        Err(other) => panic!("unexpected playback error: {other}"),
+    }
+}
