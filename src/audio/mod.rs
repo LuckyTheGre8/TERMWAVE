@@ -10,6 +10,7 @@ pub mod output;
 pub mod playback;
 pub mod queue;
 pub mod validation;
+pub mod volume;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -23,6 +24,10 @@ pub use playback::{
 };
 pub use queue::TrackQueue;
 pub use validation::{AudioFormat, ValidatedAudioFile, validate_audio_file};
+pub use volume::{
+    DEFAULT_VOLUME, DEFAULT_VOLUME_STEP, MAX_VOLUME, MIN_VOLUME, VolumeState, prevent_clipping,
+    scale_sample_safely, validate_volume, volume_from_percent,
+};
 
 /// Clearly defined lifecycle state of the playback engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -174,6 +179,10 @@ pub enum AudioError {
     /// Attempted an operation that is invalid in the current playback state.
     #[error("invalid playback state: {0}")]
     InvalidState(String),
+
+    /// Provided volume level or adjustment is invalid or out of range.
+    #[error("invalid audio volume: {0}")]
+    InvalidVolume(String),
 
     /// No audio output device is available on the system.
     #[error("no audio output device available")]

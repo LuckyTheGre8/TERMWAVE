@@ -640,3 +640,60 @@ fn supports_next_previous_navigation_and_boundaries_during_playback() {
         Err(other) => panic!("unexpected playback error: {other}"),
     }
 }
+
+#[test]
+fn supports_volume_adjustment_and_mute_across_playlist_playback() {
+    let tracks = vec![
+        fixture_path("sine_16bit_44100_stereo.flac"),
+        fixture_path("sine_24bit_48000_stereo.flac"),
+    ];
+    let controller = PlaybackController::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (playing_tx, playing_rx) = std::sync::mpsc::sync_channel::<()>(4);
+
+    // Preconfigure muted volume at 40% before playback starts.
+    controller.set_volume_percent(40).unwrap();
+    controller.mute();
+    assert_eq!(controller.effective_volume(), 0.0);
+
+    let worker_controller = controller.clone();
+    let worker_shutdown = Arc::clone(&shutdown);
+    let handle = thread::spawn(move || {
+        play_local_playlist_with_controller(&tracks, worker_controller, worker_shutdown, |event| {
+            if matches!(event, PlaybackEvent::StateChanged(PlaybackState::Playing)) {
+                let _ = playing_tx.try_send(());
+            }
+        })
+    });
+
+    if playing_rx.recv_timeout(Duration::from_secs(3)).is_ok() {
+        // Verify invalid range rejected during live playback
+        assert!(matches!(
+            controller.set_volume(1.5),
+            Err(AudioError::InvalidVolume(_))
+        ));
+        assert!(controller.is_muted());
+        assert_eq!(controller.volume_percent(), 40);
+
+        // Unmute and adjust volume while Track 1 is playing
+        controller.unmute();
+        assert!(!controller.is_muted());
+        controller.increase_volume();
+        assert_eq!(controller.volume_percent(), 45);
+
+        // Skip to Track 2 and confirm volume persists across track changes
+        let _ = controller.next_track();
+        let _ = playing_rx.recv_timeout(Duration::from_secs(3));
+        assert_eq!(controller.volume_percent(), 45);
+        assert!(!controller.is_muted());
+    }
+
+    match handle.join().expect("playback thread should join cleanly") {
+        Ok(summary) => {
+            assert_eq!(summary.final_state, PlaybackState::Ended);
+            assert_eq!(controller.volume_percent(), 45);
+        }
+        Err(AudioError::NoOutputDevice) => {}
+        Err(other) => panic!("unexpected playback error: {other}"),
+    }
+}

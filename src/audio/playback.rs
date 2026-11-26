@@ -16,8 +16,9 @@ use std::time::{Duration, Instant};
 use rodio::{ChannelCount, Player, SampleRate, Source};
 
 use super::{
-    AudioError, AudioOutput, AudioStreamInfo, FlacDecoder, OutputDeviceInfo, PlaybackState,
-    TrackQueue, ValidatedAudioFile, validate_audio_file,
+    AudioError, AudioOutput, AudioStreamInfo, DEFAULT_VOLUME_STEP, FlacDecoder, OutputDeviceInfo,
+    PlaybackState, TrackQueue, ValidatedAudioFile, VolumeState, prevent_clipping,
+    validate_audio_file,
 };
 
 /// Maximum number of decoded PCM packet buffers kept in flight.
@@ -47,6 +48,7 @@ struct ControllerInner {
     state: PlaybackState,
     player: Option<Player>,
     queue: Option<TrackQueue>,
+    volume: VolumeState,
     stop_signal: Option<Arc<AtomicBool>>,
     stop_requested: bool,
     track_switch_requested: bool,
@@ -205,6 +207,12 @@ impl ControllerInner {
             self.accumulated_elapsed += started.elapsed();
         }
         self.accumulated_elapsed
+    }
+
+    fn apply_player_volume(&self) {
+        if let Some(player) = &self.player {
+            player.set_volume(self.volume.effective_level());
+        }
     }
 }
 
@@ -376,6 +384,89 @@ impl PlaybackController {
             .map_or_else(Vec::new, TrackQueue::back_history)
     }
 
+    /// Returns the configured volume level (`0.0..=1.0`), independent of mute status.
+    pub fn volume(&self) -> f32 {
+        self.lock_inner().volume.level()
+    }
+
+    /// Returns the configured volume rounded to an integer percentage (`0..=100`).
+    pub fn volume_percent(&self) -> u8 {
+        self.lock_inner().volume.percent()
+    }
+
+    /// Returns the effective output volume gain (`0.0` when muted, otherwise [`Self::volume`]).
+    pub fn effective_volume(&self) -> f32 {
+        self.lock_inner().volume.effective_level()
+    }
+
+    /// Returns `true` if audio output is currently muted.
+    pub fn is_muted(&self) -> bool {
+        self.lock_inner().volume.is_muted()
+    }
+
+    /// Sets the volume level within `[0.0, 1.0]`, applying immediately to any active player.
+    ///
+    /// Rejects negative, `NaN`, infinite, or clipping (`> 1.0`) values with
+    /// [`AudioError::InvalidVolume`].
+    pub fn set_volume(&self, level: f32) -> Result<f32, AudioError> {
+        let mut inner = self.lock_inner();
+        let updated = inner.volume.set_level(level)?;
+        inner.apply_player_volume();
+        Ok(updated)
+    }
+
+    /// Sets the volume level as a percentage (`0..=100`), returning the normalized level.
+    pub fn set_volume_percent(&self, percent: u8) -> Result<f32, AudioError> {
+        let mut inner = self.lock_inner();
+        let updated = inner.volume.set_percent(percent)?;
+        inner.apply_player_volume();
+        Ok(updated)
+    }
+
+    /// Adjusts volume by `delta`, clamping safely within `[0.0, 1.0]` to prevent clipping.
+    ///
+    /// Returns [`AudioError::InvalidVolume`] if `delta` is non-finite.
+    pub fn adjust_volume(&self, delta: f32) -> Result<f32, AudioError> {
+        let mut inner = self.lock_inner();
+        let updated = inner.volume.adjust(delta)?;
+        inner.apply_player_volume();
+        Ok(updated)
+    }
+
+    /// Increases volume by the default 5% step, clamped safely at unity gain (`1.0`).
+    pub fn increase_volume(&self) -> f32 {
+        self.adjust_volume(DEFAULT_VOLUME_STEP)
+            .expect("DEFAULT_VOLUME_STEP is finite")
+    }
+
+    /// Decreases volume by the default 5% step, clamped cleanly at silence (`0.0`).
+    pub fn decrease_volume(&self) -> f32 {
+        self.adjust_volume(-DEFAULT_VOLUME_STEP)
+            .expect("DEFAULT_VOLUME_STEP is finite")
+    }
+
+    /// Mutes playback while preserving the configured volume level.
+    pub fn mute(&self) {
+        let mut inner = self.lock_inner();
+        inner.volume.mute();
+        inner.apply_player_volume();
+    }
+
+    /// Unmutes playback and restores output at the configured volume level.
+    pub fn unmute(&self) {
+        let mut inner = self.lock_inner();
+        inner.volume.unmute();
+        inner.apply_player_volume();
+    }
+
+    /// Toggles mute status and returns the resulting muted state (`true` if muted).
+    pub fn toggle_mute(&self) -> bool {
+        let mut inner = self.lock_inner();
+        let muted = inner.volume.toggle_mute();
+        inner.apply_player_volume();
+        muted
+    }
+
     fn lock_inner(&self) -> std::sync::MutexGuard<'_, ControllerInner> {
         self.shared
             .inner
@@ -466,6 +557,7 @@ impl PlaybackController {
             return Ok(false);
         }
         inner.state.transition_to(PlaybackState::Playing)?;
+        player.set_volume(inner.volume.effective_level());
         inner.player = Some(player);
         inner.accumulated_elapsed = Duration::ZERO;
         inner.active_since = Some(Instant::now());
@@ -1237,7 +1329,7 @@ impl Iterator for ChannelAudioSource {
 
         loop {
             if self.offset < self.current_chunk.len() {
-                let sample = self.current_chunk[self.offset];
+                let sample = prevent_clipping(self.current_chunk[self.offset]);
                 self.offset += 1;
                 return Some(sample);
             }
@@ -1655,5 +1747,72 @@ mod tests {
             ]
         );
         assert!(controller.back_history().is_empty());
+    }
+
+    #[test]
+    fn channel_audio_source_prevents_sample_clipping() {
+        let (_tx, rx) = mpsc::sync_channel(2);
+        let done = Arc::new(AtomicBool::new(true));
+        let channels = NonZeroU16::new(2).unwrap();
+        let rate = NonZeroU32::new(44_100).unwrap();
+
+        let src = ChannelAudioSource::new(
+            vec![1.5, -1.75, 0.5, f32::NAN],
+            rx,
+            channels,
+            rate,
+            None,
+            done,
+        );
+        let samples: Vec<f32> = src.collect();
+        assert_eq!(samples, vec![1.0, -1.0, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn controller_manages_volume_ranges_mute_and_clamping() {
+        let controller = PlaybackController::new();
+        assert_eq!(controller.volume(), 1.0);
+        assert_eq!(controller.volume_percent(), 100);
+        assert!(!controller.is_muted());
+        assert_eq!(controller.effective_volume(), 1.0);
+
+        // Out-of-range and non-finite inputs are rejected cleanly
+        for bad in [-0.1, 1.05, f32::NAN, f32::INFINITY] {
+            assert!(matches!(
+                controller.set_volume(bad),
+                Err(AudioError::InvalidVolume(_))
+            ));
+        }
+        assert!(matches!(
+            controller.set_volume_percent(101),
+            Err(AudioError::InvalidVolume(_))
+        ));
+        assert!(matches!(
+            controller.adjust_volume(f32::NEG_INFINITY),
+            Err(AudioError::InvalidVolume(_))
+        ));
+        assert_eq!(controller.volume(), 1.0);
+
+        // Stepping down and clamping at 0.0 / 1.0 prevents clipping
+        assert!((controller.decrease_volume() - 0.95).abs() < 1e-6);
+        assert_eq!(controller.increase_volume(), 1.0);
+        assert_eq!(controller.increase_volume(), 1.0);
+
+        controller.set_volume(0.02).unwrap();
+        assert_eq!(controller.decrease_volume(), 0.0);
+
+        // Mute / unmute preserves configured volume
+        controller.set_volume_percent(60).unwrap();
+        controller.mute();
+        assert!(controller.is_muted());
+        assert_eq!(controller.effective_volume(), 0.0);
+        assert_eq!(controller.volume_percent(), 60);
+
+        controller.unmute();
+        assert!(!controller.is_muted());
+        assert!((controller.effective_volume() - 0.6).abs() < 1e-6);
+
+        assert!(controller.toggle_mute());
+        assert!(!controller.toggle_mute());
     }
 }

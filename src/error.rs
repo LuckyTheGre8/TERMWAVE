@@ -62,6 +62,12 @@ mod tests {
             "audio error: audio output device disconnected: unplugged"
         );
 
+        let vol_err: TermwaveError = AudioError::InvalidVolume("out of range".into()).into();
+        assert!(matches!(
+            vol_err,
+            TermwaveError::Audio(AudioError::InvalidVolume(_))
+        ));
+
         let meta_err: TermwaveError = MetadataError::ReadFailed("corrupt header".into()).into();
         assert!(matches!(meta_err, TermwaveError::Metadata(_)));
 

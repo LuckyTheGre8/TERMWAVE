@@ -11,7 +11,7 @@ Termwave is a lightweight, cross-platform, lossless-first terminal Hi-Fi music p
 
 ## Status
 
-Currently at **Phase 11 (Track navigation)** in Stage 2 (Playback Engine) of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play <FILE>...` supports single-track and multi-track local FLAC playback via `TrackQueue` and `PlaybackController`, with thread-safe `next_track()`, `previous_track()`, bounded playback history, start/end boundary protection, pause/resume, stop, and interactive terminal controls (`Enter`/`toggle`, `n` next, `p` previous, `s` stop, `Ctrl+C` quit). Volume management follows in Phase 12.
+Currently at **Phase 12 (Volume management)** in Stage 2 (Playback Engine) of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play [--volume <0..100>] [--mute] <FILE>...` supports local FLAC playlists with validated volume control (`[0.0, 1.0]`, unity-capped to prevent digital clipping), mute/unmute preserving level, sample-level clipping guards, pause/resume, stop, track navigation with history, and interactive terminal commands. Seeking follows in Phase 13.
 
 ## Usage
 
@@ -19,6 +19,7 @@ Currently at **Phase 11 (Track navigation)** in Stage 2 (Playback Engine) of the
 termwave --help
 termwave --version
 termwave play <file> [<file>...]
+termwave play --volume 80 <file>
 ```
 
 ## Module Structure
@@ -26,7 +27,7 @@ termwave play <file> [<file>...]
 - `src/main.rs` — Thin binary entry point
 - `src/lib.rs` — Core library exports
 - `src/cli.rs` — Command-line interface boundary
-- `src/audio/` — Audio engine boundary (`PlaybackState`, `validation`, `decoder`, `output`, `queue`, and `playback`)
+- `src/audio/` — Audio engine boundary (`PlaybackState`, `validation`, `decoder`, `output`, `queue`, `volume`, and `playback`)
 - `src/metadata.rs` — Metadata and embedded artwork boundary
 - `src/library.rs` — Music library and SQLite persistence boundary
 - `src/config.rs` — Configuration boundary

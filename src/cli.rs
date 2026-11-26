@@ -53,6 +53,14 @@ pub struct PlayArgs {
     /// Path(s) to one or more local audio files to play sequentially.
     #[arg(value_name = "FILE", required = true, num_args = 1.., value_parser = parse_non_empty_path)]
     pub files: Vec<PathBuf>,
+
+    /// Initial playback volume percentage (0..=100).
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u8).range(0..=100))]
+    pub volume: u8,
+
+    /// Start playback muted (preserves configured volume level).
+    #[arg(long, default_value_t = false)]
+    pub mute: bool,
 }
 
 /// Arguments for the planned `info` subcommand.
@@ -98,23 +106,41 @@ fn install_shutdown_handler() -> Arc<AtomicBool> {
     Arc::clone(flag)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PlaybackControlAction {
     TogglePause,
     Pause,
     Resume,
     NextTrack,
     PreviousTrack,
+    VolumeUp,
+    VolumeDown,
+    SetVolume(String),
+    ToggleMute,
+    Unmute,
     Stop,
 }
 
 fn parse_playback_control_command(line: &str) -> Option<PlaybackControlAction> {
-    match line.trim().to_ascii_lowercase().as_str() {
+    let trimmed = line.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(arg) = lower
+        .strip_prefix("vol ")
+        .or_else(|| lower.strip_prefix("volume "))
+    {
+        return Some(PlaybackControlAction::SetVolume(arg.trim().to_string()));
+    }
+
+    match lower.as_str() {
         "" | "space" | "pp" | "toggle" => Some(PlaybackControlAction::TogglePause),
         "pause" => Some(PlaybackControlAction::Pause),
         "resume" | "play" => Some(PlaybackControlAction::Resume),
         "n" | "next" => Some(PlaybackControlAction::NextTrack),
         "p" | "prev" | "previous" => Some(PlaybackControlAction::PreviousTrack),
+        "+" | "up" | "vol+" => Some(PlaybackControlAction::VolumeUp),
+        "-" | "down" | "vol-" => Some(PlaybackControlAction::VolumeDown),
+        "m" | "mute" => Some(PlaybackControlAction::ToggleMute),
+        "unmute" => Some(PlaybackControlAction::Unmute),
         "s" | "stop" | "q" | "quit" => Some(PlaybackControlAction::Stop),
         _ => None,
     }
@@ -122,7 +148,7 @@ fn parse_playback_control_command(line: &str) -> Option<PlaybackControlAction> {
 
 fn apply_playback_control_action(
     controller: &PlaybackController,
-    action: PlaybackControlAction,
+    action: &PlaybackControlAction,
 ) -> Result<PlaybackState, crate::audio::AudioError> {
     match action {
         PlaybackControlAction::TogglePause => controller.toggle_pause(),
@@ -140,6 +166,36 @@ fn apply_playback_control_action(
         }
         PlaybackControlAction::PreviousTrack => {
             controller.previous_track()?;
+            Ok(controller.state())
+        }
+        PlaybackControlAction::VolumeUp => {
+            controller.increase_volume();
+            Ok(controller.state())
+        }
+        PlaybackControlAction::VolumeDown => {
+            controller.decrease_volume();
+            Ok(controller.state())
+        }
+        PlaybackControlAction::SetVolume(raw) => {
+            let percent: i32 = raw.parse().map_err(|_| {
+                crate::audio::AudioError::InvalidVolume(format!(
+                    "expected integer percentage 0..=100, got '{raw}'"
+                ))
+            })?;
+            let percent = u8::try_from(percent).map_err(|_| {
+                crate::audio::AudioError::InvalidVolume(format!(
+                    "volume percentage {percent}% is out of range (0..=100)"
+                ))
+            })?;
+            controller.set_volume_percent(percent)?;
+            Ok(controller.state())
+        }
+        PlaybackControlAction::ToggleMute => {
+            controller.toggle_mute();
+            Ok(controller.state())
+        }
+        PlaybackControlAction::Unmute => {
+            controller.unmute();
             Ok(controller.state())
         }
         PlaybackControlAction::Stop => {
@@ -163,14 +219,29 @@ fn spawn_stdin_control_thread(controller: PlaybackController, active: Arc<Atomic
                         break;
                     }
                     if let Some(action) = parse_playback_control_command(&line) {
-                        match apply_playback_control_action(&controller, action) {
+                        let is_volume_action = matches!(
+                            action,
+                            PlaybackControlAction::VolumeUp
+                                | PlaybackControlAction::VolumeDown
+                                | PlaybackControlAction::SetVolume(_)
+                                | PlaybackControlAction::ToggleMute
+                                | PlaybackControlAction::Unmute
+                        );
+                        match apply_playback_control_action(&controller, &action) {
                             Ok(PlaybackState::Stopped) => break,
+                            Ok(_) if is_volume_action => {
+                                if controller.is_muted() {
+                                    println!("Volume:  {}% (muted)", controller.volume_percent());
+                                } else {
+                                    println!("Volume:  {}%", controller.volume_percent());
+                                }
+                            }
                             Ok(_) => {}
                             Err(err) => eprintln!("Note:    {err}"),
                         }
                     } else {
                         eprintln!(
-                            "Note:    unknown control '{}' (use Enter/'toggle', 'pause', 'resume', 'n'/'next', 'p'/'prev', 's'/'stop', or Ctrl+C to quit)",
+                            "Note:    unknown control '{}' (use Enter/'toggle', 'n'/'next', 'p'/'prev', '+'/'-'/'vol <0..100>', 'm'/'mute', 's'/'stop', Ctrl+C)",
                             line.trim()
                         );
                     }
@@ -190,7 +261,7 @@ pub fn run() -> anyhow::Result<()> {
             let controller = PlaybackController::new();
             let active = Arc::new(AtomicBool::new(true));
             spawn_stdin_control_thread(controller.clone(), Arc::clone(&active));
-            let result = execute_play(&args.files, controller, shutdown, true);
+            let result = execute_play(args, controller, shutdown, true);
             active.store(false, Ordering::Release);
             result
         }
@@ -207,7 +278,7 @@ pub fn execute(cli: Cli) -> anyhow::Result<()> {
 pub fn execute_with_shutdown(cli: Cli, shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
     match cli.command {
         Some(Commands::Play(args)) => {
-            execute_play(&args.files, PlaybackController::new(), shutdown, false)
+            execute_play(&args, PlaybackController::new(), shutdown, false)
         }
         Some(Commands::Info(_)) => {
             anyhow::bail!("the 'info' subcommand is planned for a future phase")
@@ -231,16 +302,21 @@ pub fn execute_with_shutdown(cli: Cli, shutdown: Arc<AtomicBool>) -> anyhow::Res
 }
 
 fn execute_play(
-    files: &[PathBuf],
+    args: &PlayArgs,
     controller: PlaybackController,
     shutdown: Arc<AtomicBool>,
     show_controls_hint: bool,
 ) -> anyhow::Result<()> {
+    controller.set_volume_percent(args.volume)?;
+    if args.mute {
+        controller.mute();
+    }
+
     println!("{}", app_banner());
     let observer = controller.clone();
     let mut hint_printed = false;
     let summary = crate::audio::play_local_playlist_with_controller(
-        files,
+        &args.files,
         controller,
         shutdown,
         |event| match event {
@@ -256,7 +332,7 @@ fn execute_play(
                 if show_controls_hint && !hint_printed {
                     hint_printed = true;
                     println!(
-                        "Controls: Enter/'toggle' pause/resume, 'n' next, 'p' previous, 's' stop, Ctrl+C quit"
+                        "Controls: Enter/'toggle' pause, 'n' next, 'p' prev, '+'/'-' vol, 'm' mute, 's' stop, Ctrl+C quit"
                     );
                 }
             }
@@ -377,16 +453,26 @@ mod tests {
             cli.command,
             Some(Commands::Play(PlayArgs {
                 files: vec![PathBuf::from("music/sample.flac")],
+                volume: 100,
+                mute: false,
             }))
         );
 
-        let multi = Cli::try_parse_from(["termwave", "play", "a.flac", "b.flac"]).unwrap();
+        let multi = Cli::try_parse_from([
+            "termwave", "play", "--volume", "75", "--mute", "a.flac", "b.flac",
+        ])
+        .unwrap();
         assert_eq!(
             multi.command,
             Some(Commands::Play(PlayArgs {
                 files: vec![PathBuf::from("a.flac"), PathBuf::from("b.flac")],
+                volume: 75,
+                mute: true,
             }))
         );
+
+        let bad_vol = Cli::try_parse_from(["termwave", "play", "--volume", "150", "a.flac"]);
+        assert!(bad_vol.is_err());
     }
 
     #[test]
@@ -526,6 +612,26 @@ mod tests {
             Some(PlaybackControlAction::Stop)
         );
         assert_eq!(
+            parse_playback_control_command("+"),
+            Some(PlaybackControlAction::VolumeUp)
+        );
+        assert_eq!(
+            parse_playback_control_command("down"),
+            Some(PlaybackControlAction::VolumeDown)
+        );
+        assert_eq!(
+            parse_playback_control_command("m"),
+            Some(PlaybackControlAction::ToggleMute)
+        );
+        assert_eq!(
+            parse_playback_control_command("unmute"),
+            Some(PlaybackControlAction::Unmute)
+        );
+        assert_eq!(
+            parse_playback_control_command("vol 65"),
+            Some(PlaybackControlAction::SetVolume("65".to_string()))
+        );
+        assert_eq!(
             parse_playback_control_command("quit"),
             Some(PlaybackControlAction::Stop)
         );
@@ -536,20 +642,37 @@ mod tests {
     fn applies_playback_control_actions_with_state_validation() {
         let controller = PlaybackController::new();
         assert!(matches!(
-            apply_playback_control_action(&controller, PlaybackControlAction::TogglePause),
+            apply_playback_control_action(&controller, &PlaybackControlAction::TogglePause),
             Err(crate::audio::AudioError::InvalidState(_))
         ));
         assert!(matches!(
-            apply_playback_control_action(&controller, PlaybackControlAction::NextTrack),
+            apply_playback_control_action(&controller, &PlaybackControlAction::NextTrack),
             Err(crate::audio::AudioError::InvalidState(_))
         ));
         assert!(matches!(
-            apply_playback_control_action(&controller, PlaybackControlAction::PreviousTrack),
+            apply_playback_control_action(&controller, &PlaybackControlAction::PreviousTrack),
             Err(crate::audio::AudioError::InvalidState(_))
         ));
         assert!(matches!(
-            apply_playback_control_action(&controller, PlaybackControlAction::Stop),
+            apply_playback_control_action(&controller, &PlaybackControlAction::Stop),
             Err(crate::audio::AudioError::InvalidState(_))
+        ));
+
+        apply_playback_control_action(&controller, &PlaybackControlAction::SetVolume("50".into()))
+            .unwrap();
+        assert_eq!(controller.volume_percent(), 50);
+        apply_playback_control_action(&controller, &PlaybackControlAction::VolumeUp).unwrap();
+        assert_eq!(controller.volume_percent(), 55);
+        apply_playback_control_action(&controller, &PlaybackControlAction::VolumeDown).unwrap();
+        assert_eq!(controller.volume_percent(), 50);
+        apply_playback_control_action(&controller, &PlaybackControlAction::ToggleMute).unwrap();
+        assert!(controller.is_muted());
+        assert!(matches!(
+            apply_playback_control_action(
+                &controller,
+                &PlaybackControlAction::SetVolume("150".into())
+            ),
+            Err(crate::audio::AudioError::InvalidVolume(_))
         ));
     }
 }
