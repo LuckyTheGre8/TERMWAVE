@@ -11,7 +11,7 @@ Termwave is a lightweight, cross-platform, lossless-first terminal Hi-Fi music p
 
 ## Status
 
-Currently at **Phase 09 (Play and pause)** in Stage 2 (Playback Engine) of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play <file>` provides offline local FLAC playback with thread-safe pause, resume, toggle, validated `PlaybackState` transitions (`PlaybackController`), and interactive terminal pause/resume controls (`Enter` or `p` + `Enter`, plus `Ctrl+C` to exit). Explicit stop control and resource reset follow in Phase 10.
+Currently at **Phase 10 (Stop functionality)** in Stage 2 (Playback Engine) of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play <file>` supports offline local FLAC playback with thread-safe `pause()`, `resume()`, `toggle_pause()`, and `stop()` controls via `PlaybackController` — immediately releasing decoder/device resources, resetting playback position to zero, handling stops cleanly during loading, and offering interactive terminal commands (`Enter`/`p` to toggle pause/resume, `s`/`stop` to stop, or `Ctrl+C` to quit). Track navigation follows in Phase 11.
 
 ## Usage
 

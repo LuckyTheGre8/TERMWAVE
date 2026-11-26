@@ -400,3 +400,111 @@ fn supports_shutdown_while_playback_is_paused() {
         Err(other) => panic!("unexpected playback error: {other}"),
     }
 }
+
+#[test]
+fn supports_controller_stop_during_active_playback_and_resets_position() {
+    let controller = PlaybackController::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let notified_start = Arc::new(AtomicBool::new(false));
+
+    let worker_controller = controller.clone();
+    let worker_shutdown = Arc::clone(&shutdown);
+    let worker_events = Arc::clone(&events);
+    let worker_notified = Arc::clone(&notified_start);
+    let path = fixture_path("sine_24bit_192000_stereo.flac");
+
+    let handle = thread::spawn(move || {
+        play_local_flac_with_controller(path, worker_controller, worker_shutdown, |event| {
+            if let PlaybackEvent::StateChanged(state) = event {
+                worker_events.lock().unwrap().push(state);
+                if state == PlaybackState::Playing && !worker_notified.swap(true, Ordering::AcqRel)
+                {
+                    let _ = started_tx.try_send(());
+                }
+            }
+        })
+    });
+
+    if started_rx.recv_timeout(Duration::from_secs(3)).is_ok() {
+        controller.stop().unwrap();
+        assert_eq!(controller.state(), PlaybackState::Stopped);
+        assert_eq!(controller.position(), Duration::ZERO);
+        assert!(matches!(
+            controller.stop(),
+            Err(AudioError::InvalidState(_))
+        ));
+    }
+
+    match handle.join().expect("playback thread should join cleanly") {
+        Ok(summary) => {
+            assert_eq!(summary.final_state, PlaybackState::Stopped);
+            assert_eq!(controller.state(), PlaybackState::Stopped);
+            assert_eq!(controller.position(), Duration::ZERO);
+
+            let recorded = events.lock().unwrap().clone();
+            assert_eq!(
+                recorded,
+                vec![
+                    PlaybackState::Loading,
+                    PlaybackState::Playing,
+                    PlaybackState::Stopped,
+                ]
+            );
+
+            // Verify controller can cleanly start a subsequent track after stopping.
+            let mut next_states = Vec::new();
+            let replay = play_local_flac_with_controller(
+                fixture_path("sine_16bit_44100_stereo.flac"),
+                controller.clone(),
+                Arc::new(AtomicBool::new(false)),
+                |event| {
+                    if let PlaybackEvent::StateChanged(state) = event {
+                        next_states.push(state);
+                    }
+                },
+            )
+            .expect("controller reuse after stop should succeed");
+            assert_eq!(replay.final_state, PlaybackState::Ended);
+            assert_eq!(
+                next_states,
+                vec![
+                    PlaybackState::Loading,
+                    PlaybackState::Playing,
+                    PlaybackState::Ended,
+                ]
+            );
+        }
+        Err(AudioError::NoOutputDevice) => {}
+        Err(other) => panic!("unexpected playback error: {other}"),
+    }
+}
+
+#[test]
+fn supports_controller_stop_during_loading() {
+    let controller = PlaybackController::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut states = Vec::new();
+
+    let result = play_local_flac_with_controller(
+        fixture_path("sine_16bit_44100_stereo.flac"),
+        controller.clone(),
+        shutdown,
+        |event| {
+            if let PlaybackEvent::StateChanged(state) = event {
+                states.push(state);
+                if state == PlaybackState::Loading {
+                    controller.stop().unwrap();
+                }
+            }
+        },
+    )
+    .expect("stopping during loading should succeed cleanly");
+
+    assert_eq!(result.final_state, PlaybackState::Stopped);
+    assert_eq!(result.elapsed, Duration::ZERO);
+    assert_eq!(controller.state(), PlaybackState::Stopped);
+    assert_eq!(controller.position(), Duration::ZERO);
+    assert_eq!(states, vec![PlaybackState::Loading, PlaybackState::Stopped]);
+}

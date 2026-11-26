@@ -46,8 +46,11 @@ struct PlaybackShared {
 struct ControllerInner {
     state: PlaybackState,
     player: Option<Player>,
+    stop_signal: Option<Arc<AtomicBool>>,
+    stop_requested: bool,
     accumulated_elapsed: Duration,
     active_since: Option<Instant>,
+    last_stopped_elapsed: Duration,
     pending_events: VecDeque<PlaybackState>,
 }
 
@@ -56,6 +59,7 @@ impl fmt::Debug for ControllerInner {
         f.debug_struct("ControllerInner")
             .field("state", &self.state)
             .field("has_player", &self.player.is_some())
+            .field("stop_requested", &self.stop_requested)
             .field("accumulated_elapsed", &self.accumulated_elapsed)
             .field("pending_events", &self.pending_events)
             .finish_non_exhaustive()
@@ -97,6 +101,34 @@ impl ControllerInner {
         Ok(())
     }
 
+    fn apply_stop(&mut self) -> Result<Duration, AudioError> {
+        if self.state == PlaybackState::Stopped {
+            return Err(AudioError::InvalidState(
+                "cannot stop playback while already in state Stopped".to_string(),
+            ));
+        }
+
+        let session_elapsed = self.settle_active_elapsed();
+        self.last_stopped_elapsed = session_elapsed;
+        // Reset active playback position on stop.
+        self.accumulated_elapsed = Duration::ZERO;
+        self.active_since = None;
+
+        if let Some(player) = self.player.take() {
+            player.stop();
+            drop(player);
+        }
+
+        self.stop_requested = true;
+        if let Some(signal) = &self.stop_signal {
+            signal.store(true, Ordering::Release);
+        }
+
+        self.state.transition_to(PlaybackState::Stopped)?;
+        self.pending_events.push_back(PlaybackState::Stopped);
+        Ok(session_elapsed)
+    }
+
     fn settle_active_elapsed(&mut self) -> Duration {
         if let Some(started) = self.active_since.take() {
             self.accumulated_elapsed += started.elapsed();
@@ -126,11 +158,20 @@ impl PlaybackController {
         self.state() == PlaybackState::Paused
     }
 
-    /// Returns the active playback time elapsed so far (excluding paused durations).
-    pub fn elapsed(&self) -> Duration {
+    /// Returns the current playback position within the active track.
+    ///
+    /// Preserves the paused position while [`PlaybackState::Paused`] and resets
+    /// to [`Duration::ZERO`] when stopped or loading.
+    pub fn position(&self) -> Duration {
         let inner = self.lock_inner();
         let current_span = inner.active_since.map_or(Duration::ZERO, |t| t.elapsed());
         inner.accumulated_elapsed + current_span
+    }
+
+    /// Returns the active playback time elapsed so far (excluding paused durations),
+    /// reset to [`Duration::ZERO`] when stopped.
+    pub fn elapsed(&self) -> Duration {
+        self.position()
     }
 
     /// Pauses active playback while retaining the current stream position.
@@ -178,6 +219,16 @@ impl PlaybackController {
         Ok(next)
     }
 
+    /// Stops playback (including during loading), releases audio resources, and resets position to zero.
+    ///
+    /// Returns [`AudioError::InvalidState`] if playback is already [`PlaybackState::Stopped`].
+    pub fn stop(&self) -> Result<(), AudioError> {
+        let mut inner = self.lock_inner();
+        inner.apply_stop()?;
+        self.shared.state_changed.notify_all();
+        Ok(())
+    }
+
     fn lock_inner(&self) -> std::sync::MutexGuard<'_, ControllerInner> {
         self.shared
             .inner
@@ -189,6 +240,7 @@ impl PlaybackController {
     pub(crate) fn set_state_for_test(&self, state: PlaybackState) {
         let mut inner = self.lock_inner();
         inner.state = state;
+        inner.stop_requested = false;
         inner.active_since = if state == PlaybackState::Playing {
             Some(Instant::now())
         } else {
@@ -196,23 +248,51 @@ impl PlaybackController {
         };
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_active_player(&self) -> bool {
+        self.lock_inner().player.is_some()
+    }
+
     fn begin_loading(&self) -> Result<(), AudioError> {
         let mut inner = self.lock_inner();
         inner.state.transition_to(PlaybackState::Loading)?;
         inner.player = None;
+        inner.stop_signal = None;
+        inner.stop_requested = false;
         inner.accumulated_elapsed = Duration::ZERO;
         inner.active_since = None;
+        inner.last_stopped_elapsed = Duration::ZERO;
         inner.pending_events.clear();
         Ok(())
     }
 
-    fn start_playing(&self, player: Player) -> Result<(), AudioError> {
+    fn attach_stop_signal(&self, signal: Arc<AtomicBool>) -> bool {
         let mut inner = self.lock_inner();
+        if inner.stop_requested {
+            signal.store(true, Ordering::Release);
+            false
+        } else {
+            inner.stop_signal = Some(signal);
+            true
+        }
+    }
+
+    fn is_stop_requested(&self) -> bool {
+        self.lock_inner().stop_requested
+    }
+
+    fn start_playing(&self, player: Player, shutdown: &AtomicBool) -> Result<bool, AudioError> {
+        let mut inner = self.lock_inner();
+        if inner.stop_requested || shutdown.load(Ordering::Acquire) {
+            player.stop();
+            drop(player);
+            return Ok(false);
+        }
         inner.state.transition_to(PlaybackState::Playing)?;
         inner.player = Some(player);
         inner.active_since = Some(Instant::now());
         self.shared.state_changed.notify_all();
-        Ok(())
+        Ok(true)
     }
 
     fn drain_pending_events(&self, on_event: &mut impl FnMut(PlaybackEvent)) {
@@ -239,6 +319,7 @@ impl PlaybackController {
         {
             let elapsed = inner.settle_active_elapsed();
             drop(inner.player.take());
+            inner.stop_signal = None;
             let _ = inner.state.transition_to(PlaybackState::Ended);
             self.shared.state_changed.notify_all();
             Some(elapsed)
@@ -247,16 +328,21 @@ impl PlaybackController {
         }
     }
 
-    fn stop_active(&self) -> Duration {
+    fn finalize_stopped(&self) -> Duration {
         let mut inner = self.lock_inner();
-        let elapsed = inner.settle_active_elapsed();
-        if let Some(player) = inner.player.take() {
-            player.stop();
-            drop(player);
+        if inner.state != PlaybackState::Stopped {
+            let _ = inner.apply_stop();
+        } else {
+            if let Some(player) = inner.player.take() {
+                player.stop();
+                drop(player);
+            }
+            inner.accumulated_elapsed = Duration::ZERO;
+            inner.active_since = None;
         }
-        let _ = inner.state.transition_to(PlaybackState::Stopped);
+        inner.stop_signal = None;
         self.shared.state_changed.notify_all();
-        elapsed
+        inner.last_stopped_elapsed
     }
 
     fn fail_active(&self) {
@@ -266,13 +352,14 @@ impl PlaybackController {
             player.stop();
             drop(player);
         }
+        inner.stop_signal = None;
         let _ = inner.state.transition_to(PlaybackState::Error);
         self.shared.state_changed.notify_all();
     }
 
     fn wait_poll_or_event(&self, timeout: Duration) {
         let inner = self.lock_inner();
-        if inner.pending_events.is_empty() {
+        if inner.pending_events.is_empty() && !inner.stop_requested {
             let _ = self.shared.state_changed.wait_timeout(inner, timeout);
         }
     }
@@ -325,8 +412,8 @@ pub fn play_local_flac(
 
 /// Plays a validated local FLAC file using a caller-supplied [`PlaybackController`].
 ///
-/// Allows external callers to pause, resume, toggle playback, and observe state
-/// changes concurrently while playback runs to completion or shutdown.
+/// Allows external callers to pause, resume, toggle, stop playback (including during loading),
+/// and observe state changes concurrently while playback runs to completion or shutdown.
 pub fn play_local_flac_with_controller(
     path: impl AsRef<Path>,
     controller: PlaybackController,
@@ -336,42 +423,97 @@ pub fn play_local_flac_with_controller(
     controller.begin_loading()?;
     on_event(PlaybackEvent::StateChanged(PlaybackState::Loading));
 
+    if should_stop_now(&controller, &shutdown) {
+        return Ok(finish_with_stop(
+            &controller,
+            None,
+            None,
+            None,
+            AudioStreamInfo::uninitialized(),
+            OutputDeviceInfo::uninitialized(),
+            &mut on_event,
+        ));
+    }
+
     let validated = match validate_audio_file(path) {
         Ok(file) => file,
         Err(err) => {
-            controller.fail_active();
-            on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
-            return Err(err);
+            if should_stop_now(&controller, &shutdown) {
+                return Ok(finish_with_stop(
+                    &controller,
+                    None,
+                    None,
+                    None,
+                    AudioStreamInfo::uninitialized(),
+                    OutputDeviceInfo::uninitialized(),
+                    &mut on_event,
+                ));
+            }
+            return Err(fail_and_emit(&controller, err, &mut on_event));
         }
     };
+
+    if should_stop_now(&controller, &shutdown) {
+        return Ok(finish_with_stop(
+            &controller,
+            None,
+            None,
+            None,
+            AudioStreamInfo::uninitialized(),
+            OutputDeviceInfo::uninitialized(),
+            &mut on_event,
+        ));
+    }
 
     let decoder = match FlacDecoder::open(&validated.path) {
         Ok(dec) => dec,
         Err(err) => {
-            controller.fail_active();
-            on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
-            return Err(err);
+            if should_stop_now(&controller, &shutdown) {
+                return Ok(finish_with_stop(
+                    &controller,
+                    None,
+                    None,
+                    None,
+                    AudioStreamInfo::uninitialized(),
+                    OutputDeviceInfo::uninitialized(),
+                    &mut on_event,
+                ));
+            }
+            return Err(fail_and_emit(&controller, err, &mut on_event));
         }
     };
 
     let stream_info = decoder.stream_info().clone();
+    if should_stop_now(&controller, &shutdown) {
+        drop(decoder);
+        return Ok(finish_with_stop(
+            &controller,
+            None,
+            None,
+            None,
+            stream_info,
+            OutputDeviceInfo::uninitialized(),
+            &mut on_event,
+        ));
+    }
+
     let channels = match NonZeroU16::new(stream_info.channels) {
         Some(ch) => ch,
         None => {
-            controller.fail_active();
-            on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
-            return Err(AudioError::UnsupportedConfiguration(
-                "channel count cannot be zero".to_string(),
+            return Err(fail_and_emit(
+                &controller,
+                AudioError::UnsupportedConfiguration("channel count cannot be zero".to_string()),
+                &mut on_event,
             ));
         }
     };
     let sample_rate = match NonZeroU32::new(stream_info.sample_rate) {
         Some(rate) => rate,
         None => {
-            controller.fail_active();
-            on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
-            return Err(AudioError::UnsupportedConfiguration(
-                "sample rate cannot be zero".to_string(),
+            return Err(fail_and_emit(
+                &controller,
+                AudioError::UnsupportedConfiguration("sample rate cannot be zero".to_string()),
+                &mut on_event,
             ));
         }
     };
@@ -381,12 +523,35 @@ pub fn play_local_flac_with_controller(
     let output = match AudioOutput::open_default_with_error_sink(Some(Arc::clone(&shared_error))) {
         Ok(out) => out,
         Err(err) => {
-            controller.fail_active();
-            on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
-            return Err(err);
+            if should_stop_now(&controller, &shutdown) {
+                drop(decoder);
+                return Ok(finish_with_stop(
+                    &controller,
+                    None,
+                    None,
+                    None,
+                    stream_info,
+                    OutputDeviceInfo::uninitialized(),
+                    &mut on_event,
+                ));
+            }
+            return Err(fail_and_emit(&controller, err, &mut on_event));
         }
     };
     let output_info = output.device_info().clone();
+
+    if should_stop_now(&controller, &shutdown) {
+        drop(decoder);
+        return Ok(finish_with_stop(
+            &controller,
+            Some(output),
+            None,
+            None,
+            stream_info,
+            output_info,
+            &mut on_event,
+        ));
+    }
 
     on_event(PlaybackEvent::TrackLoaded(PlaybackTrackInfo {
         file: validated,
@@ -398,6 +563,20 @@ pub fn play_local_flac_with_controller(
     let stop_decoder = Arc::new(AtomicBool::new(false));
     let decoder_done = Arc::new(AtomicBool::new(false));
 
+    if !controller.attach_stop_signal(Arc::clone(&stop_decoder)) || shutdown.load(Ordering::Acquire)
+    {
+        drop(decoder);
+        return Ok(finish_with_stop(
+            &controller,
+            Some(output),
+            None,
+            None,
+            stream_info,
+            output_info,
+            &mut on_event,
+        ));
+    }
+
     let decoder_handle = spawn_decoder_worker(
         decoder,
         tx,
@@ -406,27 +585,34 @@ pub fn play_local_flac_with_controller(
         Arc::clone(&shared_error),
     );
 
-    let first_chunk =
-        match wait_for_initial_chunk(&rx, &shutdown, &stop_decoder, &decoder_done, &shared_error) {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => {
-                let elapsed = controller.stop_active();
-                join_decoder_worker(decoder_handle, &stop_decoder);
-                on_event(PlaybackEvent::StateChanged(PlaybackState::Stopped));
-                return Ok(PlaybackSummary {
-                    final_state: PlaybackState::Stopped,
-                    elapsed,
-                    stream: stream_info,
-                    output: output_info,
-                });
-            }
-            Err(err) => {
-                controller.fail_active();
-                join_decoder_worker(decoder_handle, &stop_decoder);
-                on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
-                return Err(err);
-            }
-        };
+    let first_chunk = match wait_for_initial_chunk(
+        &rx,
+        &controller,
+        &shutdown,
+        &stop_decoder,
+        &decoder_done,
+        &shared_error,
+    ) {
+        Ok(Some(chunk)) => chunk,
+        Ok(None) => {
+            return Ok(finish_with_stop(
+                &controller,
+                Some(output),
+                Some(decoder_handle),
+                Some(&stop_decoder),
+                stream_info,
+                output_info,
+                &mut on_event,
+            ));
+        }
+        Err(err) => {
+            controller.fail_active();
+            drop(output);
+            join_decoder_worker(decoder_handle, &stop_decoder);
+            on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
+            return Err(err);
+        }
+    };
 
     let source = ChannelAudioSource::new(
         first_chunk,
@@ -439,11 +625,26 @@ pub fn play_local_flac_with_controller(
 
     let player = Player::connect_new(output.mixer());
     player.append(source);
-    if let Err(err) = controller.start_playing(player) {
-        controller.fail_active();
-        join_decoder_worker(decoder_handle, &stop_decoder);
-        on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
-        return Err(err);
+    match controller.start_playing(player, &shutdown) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(finish_with_stop(
+                &controller,
+                Some(output),
+                Some(decoder_handle),
+                Some(&stop_decoder),
+                stream_info,
+                output_info,
+                &mut on_event,
+            ));
+        }
+        Err(err) => {
+            controller.fail_active();
+            drop(output);
+            join_decoder_worker(decoder_handle, &stop_decoder);
+            on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
+            return Err(err);
+        }
     }
     on_event(PlaybackEvent::StateChanged(PlaybackState::Playing));
 
@@ -477,18 +678,16 @@ fn wait_for_playback(
     loop {
         controller.drain_pending_events(&mut on_event);
 
-        if shutdown.load(Ordering::Acquire) {
-            let elapsed = controller.stop_active();
-            drop(output);
-            join_decoder_worker(decoder_handle, &stop_decoder);
-            controller.drain_pending_events(&mut on_event);
-            on_event(PlaybackEvent::StateChanged(PlaybackState::Stopped));
-            return Ok(PlaybackSummary {
-                final_state: PlaybackState::Stopped,
-                elapsed,
-                stream: stream_info,
-                output: output_info,
-            });
+        if should_stop_now(&controller, &shutdown) {
+            return Ok(finish_with_stop(
+                &controller,
+                Some(output),
+                Some(decoder_handle),
+                Some(&stop_decoder),
+                stream_info,
+                output_info,
+                &mut on_event,
+            ));
         }
 
         if let Some(err) = take_shared_error(&shared_error) {
@@ -502,22 +701,21 @@ fn wait_for_playback(
 
         if controller.is_ready_to_finish_playing() && decoder_done.load(Ordering::Acquire) {
             // Allow the hardware ring buffer a brief drain window unless interrupted.
-            if !shutdown.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_millis(50));
+            if !should_stop_now(&controller, &shutdown) {
+                controller.wait_poll_or_event(Duration::from_millis(50));
             }
             controller.drain_pending_events(&mut on_event);
 
-            if shutdown.load(Ordering::Acquire) {
-                let elapsed = controller.stop_active();
-                drop(output);
-                join_decoder_worker(decoder_handle, &stop_decoder);
-                on_event(PlaybackEvent::StateChanged(PlaybackState::Stopped));
-                return Ok(PlaybackSummary {
-                    final_state: PlaybackState::Stopped,
-                    elapsed,
-                    stream: stream_info,
-                    output: output_info,
-                });
+            if should_stop_now(&controller, &shutdown) {
+                return Ok(finish_with_stop(
+                    &controller,
+                    Some(output),
+                    Some(decoder_handle),
+                    Some(&stop_decoder),
+                    stream_info,
+                    output_info,
+                    &mut on_event,
+                ));
             }
 
             if let Some(err) = take_shared_error(&shared_error) {
@@ -543,6 +741,43 @@ fn wait_for_playback(
         }
 
         controller.wait_poll_or_event(POLL_INTERVAL);
+    }
+}
+
+fn should_stop_now(controller: &PlaybackController, shutdown: &AtomicBool) -> bool {
+    shutdown.load(Ordering::Acquire) || controller.is_stop_requested()
+}
+
+fn fail_and_emit(
+    controller: &PlaybackController,
+    err: AudioError,
+    on_event: &mut impl FnMut(PlaybackEvent),
+) -> AudioError {
+    controller.fail_active();
+    on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
+    err
+}
+
+fn finish_with_stop(
+    controller: &PlaybackController,
+    output: Option<AudioOutput>,
+    decoder_handle: Option<JoinHandle<()>>,
+    stop_decoder: Option<&AtomicBool>,
+    stream: AudioStreamInfo,
+    output_info: OutputDeviceInfo,
+    on_event: &mut impl FnMut(PlaybackEvent),
+) -> PlaybackSummary {
+    let elapsed = controller.finalize_stopped();
+    drop(output);
+    if let (Some(handle), Some(flag)) = (decoder_handle, stop_decoder) {
+        join_decoder_worker(handle, flag);
+    }
+    controller.drain_pending_events(on_event);
+    PlaybackSummary {
+        final_state: PlaybackState::Stopped,
+        elapsed,
+        stream,
+        output: output_info,
     }
 }
 
@@ -596,13 +831,14 @@ fn send_chunk_or_stop(
 
 fn wait_for_initial_chunk(
     rx: &Receiver<Vec<f32>>,
+    controller: &PlaybackController,
     shutdown: &AtomicBool,
     stop_decoder: &AtomicBool,
     decoder_done: &AtomicBool,
     shared_error: &Mutex<Option<AudioError>>,
 ) -> Result<Option<Vec<f32>>, AudioError> {
     loop {
-        if shutdown.load(Ordering::Acquire) {
+        if should_stop_now(controller, shutdown) {
             stop_decoder.store(true, Ordering::Release);
             return Ok(None);
         }
@@ -625,7 +861,7 @@ fn wait_for_initial_chunk(
                         "FLAC stream produced no audio samples".to_string(),
                     ));
                 }
-                thread::sleep(Duration::from_millis(5));
+                controller.wait_poll_or_event(Duration::from_millis(5));
             }
         }
     }
@@ -778,14 +1014,21 @@ mod tests {
     #[test]
     fn wait_for_initial_chunk_propagates_decoder_error() {
         let (_tx, rx) = mpsc::sync_channel(4);
+        let controller = PlaybackController::new();
         let shutdown = AtomicBool::new(false);
         let stop_decoder = AtomicBool::new(false);
         let decoder_done = AtomicBool::new(true);
         let shared_error = Mutex::new(Some(AudioError::DecodeError("bad packet".to_string())));
 
-        let err =
-            wait_for_initial_chunk(&rx, &shutdown, &stop_decoder, &decoder_done, &shared_error)
-                .unwrap_err();
+        let err = wait_for_initial_chunk(
+            &rx,
+            &controller,
+            &shutdown,
+            &stop_decoder,
+            &decoder_done,
+            &shared_error,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, AudioError::DecodeError(_)));
         assert_eq!(err.to_string(), "audio decode error: bad packet");
@@ -794,17 +1037,53 @@ mod tests {
     #[test]
     fn wait_for_initial_chunk_handles_shutdown_gracefully() {
         let (_tx, rx) = mpsc::sync_channel(4);
+        let controller = PlaybackController::new();
         let shutdown = AtomicBool::new(true);
         let stop_decoder = AtomicBool::new(false);
         let decoder_done = AtomicBool::new(false);
         let shared_error = Mutex::new(None);
 
-        let res =
-            wait_for_initial_chunk(&rx, &shutdown, &stop_decoder, &decoder_done, &shared_error)
-                .unwrap();
+        let res = wait_for_initial_chunk(
+            &rx,
+            &controller,
+            &shutdown,
+            &stop_decoder,
+            &decoder_done,
+            &shared_error,
+        )
+        .unwrap();
 
         assert!(res.is_none());
         assert!(stop_decoder.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn wait_for_initial_chunk_handles_controller_stop_during_loading() {
+        let (_tx, rx) = mpsc::sync_channel(4);
+        let controller = PlaybackController::new();
+        let shutdown = AtomicBool::new(false);
+        let stop_decoder = Arc::new(AtomicBool::new(false));
+        let decoder_done = AtomicBool::new(false);
+        let shared_error = Mutex::new(None);
+
+        controller.begin_loading().unwrap();
+        assert!(controller.attach_stop_signal(Arc::clone(&stop_decoder)));
+        controller.stop().unwrap();
+
+        let res = wait_for_initial_chunk(
+            &rx,
+            &controller,
+            &shutdown,
+            &stop_decoder,
+            &decoder_done,
+            &shared_error,
+        )
+        .unwrap();
+
+        assert!(res.is_none());
+        assert!(stop_decoder.load(Ordering::Acquire));
+        assert_eq!(controller.state(), PlaybackState::Stopped);
+        assert_eq!(controller.position(), Duration::ZERO);
     }
 
     #[test]
@@ -927,5 +1206,54 @@ mod tests {
         controller.resume().unwrap();
         thread::sleep(Duration::from_millis(25));
         assert!(controller.elapsed() > elapsed_at_pause);
+    }
+
+    #[test]
+    fn controller_stop_resets_position_releases_signals_and_rejects_already_stopped() {
+        let controller = PlaybackController::new();
+        assert!(matches!(
+            controller.stop(),
+            Err(AudioError::InvalidState(_))
+        ));
+
+        // Stop while Playing resets position and signals decoder worker
+        let stop_signal = Arc::new(AtomicBool::new(false));
+        controller.begin_loading().unwrap();
+        assert!(controller.attach_stop_signal(Arc::clone(&stop_signal)));
+        controller.set_state_for_test(PlaybackState::Playing);
+        thread::sleep(Duration::from_millis(25));
+        assert!(controller.position() >= Duration::from_millis(15));
+
+        controller.stop().unwrap();
+        assert_eq!(controller.state(), PlaybackState::Stopped);
+        assert_eq!(controller.position(), Duration::ZERO);
+        assert_eq!(controller.elapsed(), Duration::ZERO);
+        assert!(stop_signal.load(Ordering::Acquire));
+        assert!(!controller.has_active_player());
+
+        // Stopping again when already Stopped is rejected
+        assert!(matches!(
+            controller.stop(),
+            Err(AudioError::InvalidState(_))
+        ));
+
+        // Stopping from Paused or Ended also resets to Stopped at Duration::ZERO
+        controller.set_state_for_test(PlaybackState::Ended);
+        controller.stop().unwrap();
+        assert_eq!(controller.state(), PlaybackState::Stopped);
+        assert_eq!(controller.position(), Duration::ZERO);
+    }
+
+    #[test]
+    fn controller_stop_during_loading_prevents_attaching_stop_signal_afterward() {
+        let controller = PlaybackController::new();
+        controller.begin_loading().unwrap();
+        controller.stop().unwrap();
+        assert_eq!(controller.state(), PlaybackState::Stopped);
+        assert_eq!(controller.position(), Duration::ZERO);
+
+        let late_signal = Arc::new(AtomicBool::new(false));
+        assert!(!controller.attach_stop_signal(Arc::clone(&late_signal)));
+        assert!(late_signal.load(Ordering::Acquire));
     }
 }

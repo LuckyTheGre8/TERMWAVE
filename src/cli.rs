@@ -103,6 +103,7 @@ enum PlaybackControlAction {
     TogglePause,
     Pause,
     Resume,
+    Stop,
 }
 
 fn parse_playback_control_command(line: &str) -> Option<PlaybackControlAction> {
@@ -110,6 +111,7 @@ fn parse_playback_control_command(line: &str) -> Option<PlaybackControlAction> {
         "" | "p" | "toggle" => Some(PlaybackControlAction::TogglePause),
         "pause" => Some(PlaybackControlAction::Pause),
         "resume" | "play" => Some(PlaybackControlAction::Resume),
+        "s" | "stop" | "q" | "quit" => Some(PlaybackControlAction::Stop),
         _ => None,
     }
 }
@@ -128,6 +130,10 @@ fn apply_playback_control_action(
             controller.resume()?;
             Ok(PlaybackState::Playing)
         }
+        PlaybackControlAction::Stop => {
+            controller.stop()?;
+            Ok(PlaybackState::Stopped)
+        }
     }
 }
 
@@ -145,12 +151,14 @@ fn spawn_stdin_control_thread(controller: PlaybackController, active: Arc<Atomic
                         break;
                     }
                     if let Some(action) = parse_playback_control_command(&line) {
-                        if let Err(err) = apply_playback_control_action(&controller, action) {
-                            eprintln!("Note:    {err}");
+                        match apply_playback_control_action(&controller, action) {
+                            Ok(PlaybackState::Stopped) => break,
+                            Ok(_) => {}
+                            Err(err) => eprintln!("Note:    {err}"),
                         }
                     } else {
                         eprintln!(
-                            "Note:    unknown control '{}' (use Enter/'p' to toggle, 'pause', 'resume', or Ctrl+C to quit)",
+                            "Note:    unknown control '{}' (use Enter/'p' to toggle, 'pause', 'resume', 's'/'stop', or Ctrl+C to quit)",
                             line.trim()
                         );
                     }
@@ -229,7 +237,7 @@ fn execute_play(
                 print_track_info(&info);
                 if show_controls_hint {
                     println!(
-                        "Controls: press Enter or 'p' + Enter to pause/resume, or Ctrl+C to quit"
+                        "Controls: press Enter/'p' to pause/resume, 's' to stop, or Ctrl+C to quit"
                     );
                 }
             }
@@ -451,6 +459,18 @@ mod tests {
             parse_playback_control_command("play"),
             Some(PlaybackControlAction::Resume)
         );
+        assert_eq!(
+            parse_playback_control_command("s"),
+            Some(PlaybackControlAction::Stop)
+        );
+        assert_eq!(
+            parse_playback_control_command("STOP"),
+            Some(PlaybackControlAction::Stop)
+        );
+        assert_eq!(
+            parse_playback_control_command("quit"),
+            Some(PlaybackControlAction::Stop)
+        );
         assert_eq!(parse_playback_control_command("seek"), None);
     }
 
@@ -459,6 +479,10 @@ mod tests {
         let controller = PlaybackController::new();
         assert!(matches!(
             apply_playback_control_action(&controller, PlaybackControlAction::TogglePause),
+            Err(crate::audio::AudioError::InvalidState(_))
+        ));
+        assert!(matches!(
+            apply_playback_control_action(&controller, PlaybackControlAction::Stop),
             Err(crate::audio::AudioError::InvalidState(_))
         ));
     }

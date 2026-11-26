@@ -44,6 +44,20 @@ pub struct AudioStreamInfo {
     pub duration: Option<Duration>,
 }
 
+impl AudioStreamInfo {
+    /// Placeholder stream metadata used when playback is stopped before decoding starts.
+    pub(crate) fn uninitialized() -> Self {
+        Self {
+            codec: "FLAC",
+            sample_rate: 0,
+            bits_per_sample: None,
+            channels: 0,
+            total_frames: None,
+            duration: None,
+        }
+    }
+}
+
 /// Streaming FLAC decoder backed by any [`MediaSource`].
 pub struct FlacDecoder {
     format: Box<dyn FormatReader>,

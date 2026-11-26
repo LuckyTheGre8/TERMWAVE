@@ -38,7 +38,7 @@ src/
 - Audio callbacks must remain non-blocking and free of disk/network I/O or UI synchronization locks.
 - State machine & playback control:
   - `PlaybackState::can_transition_to` and `PlaybackState::transition_to` enforce valid engine lifecycle transitions and reject invalid operations via `AudioError::InvalidState`.
-  - `PlaybackController` provides thread-safe `pause()`, `resume()`, `toggle_pause()`, active playback elapsed timing (excluding paused duration), and non-blocking state queries without stalling the audio output path.
+  - `PlaybackController` provides thread-safe `pause()`, `resume()`, `toggle_pause()`, `stop()`, active playback position tracking (preserving position across pauses and resetting to `Duration::ZERO` on stop), cancellation during loading, and immediate release of audio player, output sink, and decoder worker resources.
 - Robust error propagation:
   - Input validation traps nonexistent, empty, non-file, unsupported, and process-locked audio files before playback begins.
   - Decoder traps corrupted headers, truncated packets, unsupported sample formats/rates, and non-finite (`NaN`/`Inf`) PCM audio samples.

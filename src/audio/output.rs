@@ -29,6 +29,18 @@ pub struct OutputDeviceInfo {
     pub sample_format: String,
 }
 
+impl OutputDeviceInfo {
+    /// Placeholder device metadata used when playback is stopped before opening output.
+    pub(crate) fn uninitialized() -> Self {
+        Self {
+            name: "Not initialized".to_string(),
+            sample_rate: 0,
+            channels: 0,
+            sample_format: "none".to_string(),
+        }
+    }
+}
+
 impl fmt::Display for OutputDeviceInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
