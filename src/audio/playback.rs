@@ -92,7 +92,9 @@ pub fn play_local_flac(
         AudioError::UnsupportedConfiguration("sample rate cannot be zero".to_string())
     })?;
 
-    let output = match AudioOutput::open_default() {
+    let shared_error = Arc::new(Mutex::new(None));
+
+    let output = match AudioOutput::open_default_with_error_sink(Some(Arc::clone(&shared_error))) {
         Ok(out) => out,
         Err(err) => {
             on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
@@ -110,7 +112,6 @@ pub fn play_local_flac(
     let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(PACKET_CHANNEL_CAPACITY);
     let stop_decoder = Arc::new(AtomicBool::new(false));
     let decoder_done = Arc::new(AtomicBool::new(false));
-    let shared_error = Arc::new(Mutex::new(None));
 
     let decoder_handle = spawn_decoder_worker(
         decoder,
@@ -468,5 +469,37 @@ mod tests {
         // Once decoder finishes, source terminates cleanly
         done.store(true, Ordering::Release);
         assert_eq!(src.next(), None);
+    }
+
+    #[test]
+    fn wait_for_initial_chunk_propagates_decoder_error() {
+        let (_tx, rx) = mpsc::sync_channel(4);
+        let shutdown = AtomicBool::new(false);
+        let stop_decoder = AtomicBool::new(false);
+        let decoder_done = AtomicBool::new(true);
+        let shared_error = Mutex::new(Some(AudioError::DecodeError("bad packet".to_string())));
+
+        let err =
+            wait_for_initial_chunk(&rx, &shutdown, &stop_decoder, &decoder_done, &shared_error)
+                .unwrap_err();
+
+        assert!(matches!(err, AudioError::DecodeError(_)));
+        assert_eq!(err.to_string(), "audio decode error: bad packet");
+    }
+
+    #[test]
+    fn wait_for_initial_chunk_handles_shutdown_gracefully() {
+        let (_tx, rx) = mpsc::sync_channel(4);
+        let shutdown = AtomicBool::new(true);
+        let stop_decoder = AtomicBool::new(false);
+        let decoder_done = AtomicBool::new(false);
+        let shared_error = Mutex::new(None);
+
+        let res =
+            wait_for_initial_chunk(&rx, &shutdown, &stop_decoder, &decoder_done, &shared_error)
+                .unwrap();
+
+        assert!(res.is_none());
+        assert!(stop_decoder.load(Ordering::Acquire));
     }
 }

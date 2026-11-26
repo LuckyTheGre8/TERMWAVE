@@ -36,6 +36,10 @@ src/
 - Decoders must remain decoupled from filesystem paths so local files, HTTP streams, and network sources share the same playback pipeline.
 - Seeking capability must be represented explicitly rather than assumed for every source.
 - Audio callbacks must remain non-blocking and free of disk/network I/O or UI synchronization locks.
+- Robust error propagation:
+  - Input validation traps nonexistent, empty, non-file, unsupported, and process-locked audio files before playback begins.
+  - Decoder traps corrupted headers, truncated packets, unsupported sample formats/rates, and non-finite (`NaN`/`Inf`) PCM audio samples.
+  - Audio output hooks CPAL stream error callbacks into a thread-safe error sink to report asynchronous device loss (`AudioError::DeviceLost`) and fatal backend faults without dropping audio thread safety.
 
 ### `metadata` (`src/metadata.rs`)
 - Extracts track tags, technical stream properties, and bounded embedded artwork.

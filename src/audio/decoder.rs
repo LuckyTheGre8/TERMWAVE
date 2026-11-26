@@ -193,6 +193,17 @@ impl FlacDecoder {
                 .as_mut()
                 .expect("sample buffer initialized above");
             buf.copy_interleaved_ref(decoded);
+
+            for &sample in buf.samples() {
+                if !sample.is_finite() {
+                    self.finished = true;
+                    return Err(AudioError::DecodeError(
+                        "corrupted audio data: non-finite sample encountered in decoded frame"
+                            .to_string(),
+                    ));
+                }
+            }
+
             return Ok(Some(buf.samples()));
         }
     }
@@ -209,7 +220,7 @@ impl FlacDecoder {
             )));
         }
 
-        if self.decoded_frames == 0 && self.info.total_frames != Some(0) {
+        if self.decoded_frames == 0 {
             return Err(AudioError::DecodeError(
                 "FLAC stream ended with no decodable audio frames".to_string(),
             ));
@@ -317,6 +328,14 @@ fn map_decode_error(err: SymphoniaError) -> AudioError {
         }
         SymphoniaError::ResetRequired => {
             AudioError::DecodeError("FLAC stream reset required mid-stream".to_string())
+        }
+        SymphoniaError::IoError(io_err) if io_err.kind() == ErrorKind::UnexpectedEof => {
+            AudioError::DecodeError("unexpected end of file: truncated FLAC stream".to_string())
+        }
+        SymphoniaError::IoError(io_err) if io_err.kind() == ErrorKind::PermissionDenied => {
+            AudioError::PermissionDenied {
+                path: std::path::PathBuf::from("audio stream"),
+            }
         }
         SymphoniaError::IoError(io_err) => AudioError::Io(io_err),
         other => AudioError::DecodeError(format!("FLAC decode failure: {other}")),

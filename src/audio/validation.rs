@@ -145,6 +145,14 @@ fn read_header_prefix(file: &mut File, buf: &mut [u8]) -> std::io::Result<usize>
 
 /// Maps filesystem I/O errors into descriptive [`AudioError`] variants.
 fn map_io_error(path: &Path, action: &str, err: std::io::Error) -> AudioError {
+    #[cfg(windows)]
+    if err.raw_os_error() == Some(32) || err.raw_os_error() == Some(33) {
+        return AudioError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "file is locked by another process (sharing violation)".to_string(),
+        };
+    }
+
     match err.kind() {
         ErrorKind::NotFound => AudioError::FileNotFound {
             path: path.to_path_buf(),

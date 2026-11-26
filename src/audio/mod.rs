@@ -123,6 +123,10 @@ pub enum AudioError {
     #[error("no audio output device available")]
     NoOutputDevice,
 
+    /// Audio output device was disconnected or became unavailable.
+    #[error("audio output device disconnected: {0}")]
+    DeviceLost(String),
+
     /// System audio output backend failure.
     #[error("audio output backend failure: {0}")]
     Backend(String),

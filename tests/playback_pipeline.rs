@@ -162,3 +162,98 @@ fn reports_error_for_corrupted_flac_file() {
         other => panic!("expected DecodeError, got {other:?}"),
     }
 }
+
+#[test]
+fn reports_error_for_missing_file() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut states = Vec::new();
+    let result = play_local_flac("non_existent_audio_file_12345.flac", shutdown, |event| {
+        if let PlaybackEvent::StateChanged(state) = event {
+            states.push(state);
+        }
+    });
+
+    match result {
+        Err(AudioError::FileNotFound { path }) => {
+            assert_eq!(path, PathBuf::from("non_existent_audio_file_12345.flac"));
+            assert_eq!(states, vec![PlaybackState::Loading, PlaybackState::Error]);
+        }
+        other => panic!("expected FileNotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn reports_error_for_directory_input() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut states = Vec::new();
+    let result = play_local_flac(fixture_path(""), shutdown, |event| {
+        if let PlaybackEvent::StateChanged(state) = event {
+            states.push(state);
+        }
+    });
+
+    match result {
+        Err(AudioError::NotAFile { .. }) => {
+            assert_eq!(states, vec![PlaybackState::Loading, PlaybackState::Error]);
+        }
+        other => panic!("expected NotAFile, got {other:?}"),
+    }
+}
+
+#[test]
+fn reports_error_for_zero_byte_flac_file() {
+    let temp_path =
+        std::env::temp_dir().join(format!("termwave_empty_{}.flac", std::process::id()));
+    fs::write(&temp_path, b"").expect("write empty temp file");
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut states = Vec::new();
+    let result = play_local_flac(&temp_path, shutdown, |event| {
+        if let PlaybackEvent::StateChanged(state) = event {
+            states.push(state);
+        }
+    });
+    let _ = fs::remove_file(&temp_path);
+
+    match result {
+        Err(AudioError::EmptyFile { .. }) => {
+            assert_eq!(states, vec![PlaybackState::Loading, PlaybackState::Error]);
+        }
+        other => panic!("expected EmptyFile, got {other:?}"),
+    }
+}
+
+#[test]
+fn reports_error_for_truncated_stream_mid_playback() {
+    let full = fs::read(fixture_path("sine_24bit_192000_stereo.flac")).expect("read fixture");
+    // Keep header and first packet, drop the rest
+    let truncated = full[..full.len() - 1024].to_vec();
+
+    let temp_path = std::env::temp_dir().join(format!(
+        "termwave_mid_truncated_{}.flac",
+        std::process::id()
+    ));
+    fs::write(&temp_path, &truncated).expect("write truncated temp file");
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut states = Vec::new();
+    let result = play_local_flac(&temp_path, shutdown, |event| {
+        if let PlaybackEvent::StateChanged(state) = event {
+            states.push(state);
+        }
+    });
+    let _ = fs::remove_file(&temp_path);
+
+    match result {
+        Err(AudioError::DecodeError(msg)) => {
+            assert!(
+                msg.contains("truncated")
+                    || msg.contains("unexpected end")
+                    || msg.contains("corrupted")
+            );
+            assert_eq!(states.last(), Some(&PlaybackState::Error));
+        }
+        Err(AudioError::NoOutputDevice) => {}
+        other => panic!("expected DecodeError, got {other:?}"),
+    }
+}

@@ -52,6 +52,16 @@ mod tests {
             "audio error: invalid playback state: not playing"
         );
 
+        let device_err: TermwaveError = AudioError::DeviceLost("unplugged".into()).into();
+        assert!(matches!(
+            device_err,
+            TermwaveError::Audio(AudioError::DeviceLost(_))
+        ));
+        assert_eq!(
+            device_err.to_string(),
+            "audio error: audio output device disconnected: unplugged"
+        );
+
         let meta_err: TermwaveError = MetadataError::ReadFailed("corrupt header".into()).into();
         assert!(matches!(meta_err, TermwaveError::Metadata(_)));
 

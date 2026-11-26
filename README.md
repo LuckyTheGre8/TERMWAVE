@@ -11,7 +11,7 @@ Termwave is a lightweight, cross-platform, lossless-first terminal Hi-Fi music p
 
 ## Status
 
-Currently at **Phase 07 (Basic playback)** of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play <file>` validates local FLAC files, decodes audio on a dedicated worker thread via Symphonia, outputs through the default system audio device via `rodio`/`cpal`, displays source and output properties plus playback status, and handles clean Ctrl+C shutdown. Error-handling hardening follows in Phase 08 (Milestone 1).
+Completed **Phase 08 (Playback error handling)**, concluding **Milestone 1: Working Local FLAC Player** of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play <file>` provides robust offline local FLAC playback: validating inputs, rejecting invalid/corrupt audio and non-finite samples, catching asynchronous audio output device disconnections and backend errors, and gracefully handling unexpected I/O or permission failures with actionable user feedback. Stage 2 (Playback Engine) will introduce interactive playback controls (pause/resume, stop, seeking, volume).
 
 ## Usage
 

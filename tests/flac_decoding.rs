@@ -172,3 +172,16 @@ fn rejects_unsupported_non_flac_container() {
     let err = FlacDecoder::from_source(Box::new(Cursor::new(wav_header.to_vec())), Some("wav"));
     assert!(err.is_err());
 }
+
+#[test]
+fn detects_stream_truncated_before_audio_frames() {
+    let full = fs::read(fixture_path("sine_16bit_44100_stereo.flac")).expect("read fixture bytes");
+    // Truncate right around end of metadata blocks so no full frame can be decoded.
+    let truncated = full[..350.min(full.len())].to_vec();
+    if let Ok(mut decoder) =
+        FlacDecoder::from_source(Box::new(Cursor::new(truncated)), Some("flac"))
+    {
+        let err = decode_all(&mut decoder).unwrap_err();
+        assert!(matches!(err, AudioError::DecodeError(_)));
+    }
+}
