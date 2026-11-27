@@ -11,6 +11,10 @@ pub mod error;
 pub mod library;
 pub mod metadata;
 
+pub use library::{
+    BackgroundScanHandle, LibraryError, ScanOptions, ScanProgress, ScanSummary, ScanWarning,
+    ScannedAudioFormat, ScannedTrack, scan_directories, scan_directory, spawn_directory_scan,
+};
 pub use metadata::{
     ArtworkDimensions, ArtworkExtractOptions, ArtworkFormat, ArtworkRole, ArtworkSummary,
     EmbeddedArtwork, MetadataError, TerminalArtwork, TerminalArtworkLayout, TrackMetadata,

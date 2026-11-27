@@ -11,7 +11,7 @@ Termwave is a lightweight, cross-platform, lossless-first terminal Hi-Fi music p
 
 ## Status
 
-Currently at **Phase 17 (Embedded artwork)** in Stage 3 (Metadata and Music Library) of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play` integrates `lofty` to extract FLAC Vorbis comments (track title, artist, album, album artist, track number, track total, disc number, disc total, genre, year, date) and embedded album artwork (format detection, pixel dimension parsing, bounded memory safety checks, missing-artwork handling, and terminal-ready layout/placeholder preparation) while gracefully supporting missing tags and malformed metadata without playback failure, alongside consecutive track lookahead, decoder preloading, hardware audio stream reuse, volume/mute state preservation across tracks, and centralized state tracking. Directory scanning follows in Phase 18.
+Currently at **Phase 18 (Directory scanning)** in Stage 3 (Metadata and Music Library) of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play` integrates `lofty` to extract FLAC Vorbis comments and embedded album artwork while gracefully supporting missing tags and malformed metadata without playback failure, alongside consecutive track lookahead, decoder preloading, hardware audio stream reuse, volume/mute state preservation across tracks, centralized state tracking, and non-blocking recursive directory scanning via `walkdir`. SQLite persistence follows in Phase 19.
 
 ## Usage
 
@@ -29,7 +29,7 @@ termwave play --volume 80 <file>
 - `src/cli.rs` — Command-line interface boundary
 - `src/audio/` — Audio engine boundary (`PlaybackState`, `validation`, `decoder`, `output`, `queue`, `volume`, and `playback`)
 - `src/metadata/` — Metadata (`mod.rs`) and embedded artwork (`artwork.rs`) boundary
-- `src/library.rs` — Music library and SQLite persistence boundary
+- `src/library/` — Music library directory scanning (`scanner.rs`) and future SQLite persistence boundary
 - `src/config.rs` — Configuration boundary
 - `src/error.rs` — Unified `TermwaveError` (`thiserror`) and `Result<T>`
 

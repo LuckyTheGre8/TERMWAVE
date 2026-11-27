@@ -1191,3 +1191,40 @@ fn extracts_embedded_artwork_summary_during_flac_playback() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn background_library_scan_runs_without_blocking_flac_playback() {
+    use termwave::library::{ScanOptions, ScannedAudioFormat, spawn_directory_scan};
+
+    let temp_dir = std::env::temp_dir().join("termwave_phase18_concurrent_scan");
+    let _ = fs::remove_dir_all(&temp_dir);
+    let sub_dir = temp_dir.join("artist").join("album");
+    fs::create_dir_all(&sub_dir).unwrap();
+
+    let src = fixture_path("sine_16bit_44100_stereo.flac");
+    let track_a = temp_dir.join("a.flac");
+    let track_b = sub_dir.join("b.flac");
+    fs::copy(&src, &track_a).unwrap();
+    fs::copy(&src, &track_b).unwrap();
+    fs::write(sub_dir.join("readme.txt"), b"ignore me").unwrap();
+
+    // Start background directory scan concurrently with FLAC playback
+    let scan_handle = spawn_directory_scan(vec![temp_dir.clone()], ScanOptions::default());
+
+    let controller = PlaybackController::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let playback_result = play_local_flac_with_controller(&track_a, controller, shutdown, |_| {});
+
+    match playback_result {
+        Ok(summary) => assert_eq!(summary.final_state, PlaybackState::Ended),
+        Err(AudioError::NoOutputDevice) => {}
+        Err(other) => panic!("unexpected playback error: {other}"),
+    }
+
+    let scan_summary = scan_handle.join().expect("background scan should succeed");
+    assert_eq!(scan_summary.tracks.len(), 2);
+    assert_eq!(scan_summary.tracks[0].format, ScannedAudioFormat::Flac);
+    assert_eq!(scan_summary.ignored_files, 1);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
