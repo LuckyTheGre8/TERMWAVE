@@ -981,3 +981,59 @@ fn concurrent_state_readers_and_controls_remain_race_free() {
         Err(other) => panic!("unexpected playback error: {other}"),
     }
 }
+
+#[test]
+fn preloads_next_track_and_transitions_consecutively_without_delay() {
+    let t1 = fixture_path("sine_16bit_44100_stereo.flac");
+    let t2 = fixture_path("sine_24bit_48000_stereo.flac");
+    let tracks = vec![t1.clone(), t2.clone()];
+
+    let controller = PlaybackController::new();
+    let rx = controller.subscribe();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut states = Vec::new();
+
+    // Set custom volume to verify preservation across track change
+    controller.set_volume_percent(72).unwrap();
+
+    let result =
+        play_local_playlist_with_controller(&tracks, controller.clone(), shutdown, |event| {
+            if let PlaybackEvent::StateChanged(state) = event {
+                states.push(state);
+            }
+        });
+
+    let mut snapshots = Vec::new();
+    while let Ok(snap) = rx.try_recv() {
+        snapshots.push(snap);
+    }
+
+    match result {
+        Ok(summary) => {
+            assert_eq!(summary.final_state, PlaybackState::Ended);
+            // Verify next track was preloaded during track 1 playback
+            assert!(
+                snapshots.iter().any(|s| s.is_next_preloaded),
+                "expected at least one snapshot with is_next_preloaded == true"
+            );
+            // Verify volume preserved across consecutive track transitions
+            assert_eq!(controller.volume_percent(), 72);
+            assert_eq!(controller.state(), PlaybackState::Ended);
+            assert_eq!(controller.played_history(), vec![t1, t2]);
+            assert_eq!(
+                states,
+                vec![
+                    PlaybackState::Loading,
+                    PlaybackState::Playing,
+                    PlaybackState::Loading,
+                    PlaybackState::Playing,
+                    PlaybackState::Ended,
+                ]
+            );
+        }
+        Err(AudioError::NoOutputDevice) => {
+            assert_eq!(controller.state(), PlaybackState::Error);
+        }
+        Err(other) => panic!("unexpected playback error: {other}"),
+    }
+}

@@ -62,8 +62,50 @@ pub struct PlaybackSnapshot {
     pub has_next: bool,
     /// Whether navigating to a previous track is possible.
     pub has_previous: bool,
+    /// Whether the consecutive track in the queue has been preloaded ahead of time.
+    pub is_next_preloaded: bool,
     /// Error description recorded when playback enters [`PlaybackState::Error`].
     pub last_error: Option<String>,
+}
+
+/// A preloaded track containing validated file metadata, open decoder, and stream properties.
+pub struct PreloadedTrack {
+    /// Validated local audio file information.
+    pub file: ValidatedAudioFile,
+    /// Pre-opened and initialized FLAC decoder.
+    pub decoder: FlacDecoder,
+    /// Source stream properties extracted during preload.
+    pub stream_info: AudioStreamInfo,
+}
+
+impl fmt::Debug for PreloadedTrack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreloadedTrack")
+            .field("file", &self.file)
+            .field("stream_info", &self.stream_info)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreloadedTrack {
+    /// Opens and validates a track ahead of playback, eliminating I/O and format parsing delay.
+    pub fn preload(path: impl AsRef<Path>) -> Result<Self, AudioError> {
+        let file = validate_audio_file(path)?;
+        let decoder = FlacDecoder::open(&file.path)?;
+        let stream_info = decoder.stream_info().clone();
+        Ok(Self {
+            file,
+            decoder,
+            stream_info,
+        })
+    }
+
+    /// Returns `true` if this preloaded track has matching channel count and sample rate
+    /// compatible with the given stream info.
+    pub fn is_format_compatible(&self, current: &AudioStreamInfo) -> bool {
+        self.stream_info.sample_rate == current.sample_rate
+            && self.stream_info.channels == current.channels
+    }
 }
 
 /// Thread-safe playback control and state handle.
@@ -88,6 +130,7 @@ struct ControllerInner {
     state: PlaybackState,
     player: Option<Player>,
     queue: Option<TrackQueue>,
+    preloaded_next: Option<PreloadedTrack>,
     track_info: Option<PlaybackTrackInfo>,
     last_error: Option<String>,
     volume: VolumeState,
@@ -302,6 +345,7 @@ impl ControllerInner {
 
         self.stop_requested = true;
         self.track_info = None;
+        self.preloaded_next = None;
         self.last_error = None;
         if let Some(signal) = &self.stop_signal {
             signal.store(true, Ordering::Release);
@@ -343,6 +387,7 @@ impl ControllerInner {
         let _ = self.pause_active_timer();
         self.accumulated_elapsed = Duration::ZERO;
         self.track_info = None;
+        self.preloaded_next = None;
         self.last_error = None;
         self.seek_capabilities = SeekCapabilities::default();
         if let Some(coord) = &self.seek_coordinator {
@@ -443,6 +488,7 @@ impl ControllerInner {
             track_count: self.queue.as_ref().map_or(0, TrackQueue::len),
             has_next: self.queue.as_ref().is_some_and(TrackQueue::has_next),
             has_previous: self.queue.as_ref().is_some_and(TrackQueue::has_previous),
+            is_next_preloaded: self.preloaded_next.is_some(),
             last_error: self.last_error.clone(),
         }
     }
@@ -491,6 +537,98 @@ impl PlaybackController {
     /// Returns the most recent playback error message when halted by a failure.
     pub fn last_error(&self) -> Option<String> {
         self.lock_inner().last_error.clone()
+    }
+
+    /// Returns `true` if the consecutive track in the queue has been preloaded.
+    pub fn is_next_track_preloaded(&self) -> bool {
+        self.lock_inner().preloaded_next.is_some()
+    }
+
+    /// Returns the path of the next upcoming track in the queue, if any.
+    pub fn peek_next_track(&self) -> Option<PathBuf> {
+        self.lock_inner()
+            .queue
+            .as_ref()
+            .and_then(|q| q.peek_next().map(Path::to_path_buf))
+    }
+
+    /// Returns the path of the previous track in visited history, if any.
+    pub fn peek_previous_track(&self) -> Option<PathBuf> {
+        self.lock_inner()
+            .queue
+            .as_ref()
+            .and_then(|q| q.peek_previous().map(Path::to_path_buf))
+    }
+
+    /// Returns the stream info of the preloaded next track, if available.
+    pub fn preloaded_stream_info(&self) -> Option<AudioStreamInfo> {
+        self.lock_inner()
+            .preloaded_next
+            .as_ref()
+            .map(|p| p.stream_info.clone())
+    }
+
+    /// Preloads the consecutive track in the queue if one exists and is not already preloaded.
+    ///
+    /// Performs file validation and FLAC format probing off the audio thread so the subsequent
+    /// track transition requires zero filesystem or decoding startup latency.
+    pub fn preload_next_track(&self) -> Result<bool, AudioError> {
+        let next_path = {
+            let inner = self.lock_inner();
+            if inner.preloaded_next.is_some() {
+                return Ok(false);
+            }
+            match inner
+                .queue
+                .as_ref()
+                .and_then(|q| q.peek_next().map(Path::to_path_buf))
+            {
+                Some(p) => p,
+                None => return Ok(false),
+            }
+        };
+
+        let preloaded = PreloadedTrack::preload(&next_path)?;
+
+        let mut inner = self.lock_inner();
+        let still_next = inner
+            .queue
+            .as_ref()
+            .and_then(|q| q.peek_next())
+            .is_some_and(|p| p == next_path);
+
+        if still_next && inner.preloaded_next.is_none() {
+            inner.preloaded_next = Some(preloaded);
+            self.commit_and_notify(inner);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Clears any currently preloaded track.
+    pub fn clear_preloaded_track(&self) {
+        let mut inner = self.lock_inner();
+        if inner.preloaded_next.is_some() {
+            inner.preloaded_next = None;
+            self.commit_and_notify(inner);
+        }
+    }
+
+    pub(crate) fn take_preloaded_track_if_matches(&self, path: &Path) -> Option<PreloadedTrack> {
+        let mut inner = self.lock_inner();
+        if inner
+            .preloaded_next
+            .as_ref()
+            .is_some_and(|p| p.file.path == path)
+        {
+            let preloaded = inner.preloaded_next.take();
+            self.commit_and_notify(inner);
+            preloaded
+        } else {
+            inner.preloaded_next = None;
+            None
+        }
     }
 
     /// Subscribes an application component to centralized playback state snapshots.
@@ -856,6 +994,7 @@ impl PlaybackController {
         inner.state.transition_to(PlaybackState::Loading)?;
         inner.player = None;
         inner.queue = Some(queue);
+        inner.preloaded_next = None;
         inner.track_info = None;
         inner.last_error = None;
         inner.seek_capabilities = SeekCapabilities::default();
@@ -1214,6 +1353,8 @@ pub fn play_local_playlist_with_controller<P: AsRef<Path>>(
 
     controller.begin_loading_with_queue(queue)?;
 
+    let mut shared_output = None;
+
     loop {
         // Clear any pending switch flag before loading the newly selected track.
         let _ = controller.take_track_switch();
@@ -1223,7 +1364,16 @@ pub fn play_local_playlist_with_controller<P: AsRef<Path>>(
             ));
         };
 
-        match play_single_queue_track(&track_path, &controller, &shutdown, &mut on_event)? {
+        let preloaded = controller.take_preloaded_track_if_matches(&track_path);
+
+        match play_single_queue_track(
+            &track_path,
+            preloaded,
+            &controller,
+            &shutdown,
+            &mut shared_output,
+            &mut on_event,
+        )? {
             TrackWaitOutcome::SwitchTrack => continue,
             TrackWaitOutcome::Stopped(summary) | TrackWaitOutcome::Ended(summary) => {
                 return Ok(summary);
@@ -1234,8 +1384,10 @@ pub fn play_local_playlist_with_controller<P: AsRef<Path>>(
 
 fn play_single_queue_track(
     path: &Path,
+    preloaded: Option<PreloadedTrack>,
     controller: &PlaybackController,
     shutdown: &AtomicBool,
+    shared_output: &mut Option<AudioOutput>,
     on_event: &mut impl FnMut(PlaybackEvent),
 ) -> Result<TrackWaitOutcome, AudioError> {
     on_event(PlaybackEvent::StateChanged(PlaybackState::Loading));
@@ -1243,7 +1395,7 @@ fn play_single_queue_track(
     if should_stop_now(controller, shutdown) {
         return Ok(stop_before_worker(
             controller,
-            None,
+            shared_output.take(),
             AudioStreamInfo::uninitialized(),
             OutputDeviceInfo::uninitialized(),
             on_event,
@@ -1253,63 +1405,69 @@ fn play_single_queue_track(
         return Ok(TrackWaitOutcome::SwitchTrack);
     }
 
-    let validated = match validate_audio_file(path) {
-        Ok(file) => file,
-        Err(err) => {
-            if should_stop_now(controller, shutdown) {
-                return Ok(stop_before_worker(
-                    controller,
-                    None,
-                    AudioStreamInfo::uninitialized(),
-                    OutputDeviceInfo::uninitialized(),
-                    on_event,
-                ));
+    let (validated, decoder, stream_info) = if let Some(pre) = preloaded {
+        (pre.file, pre.decoder, pre.stream_info)
+    } else {
+        let validated = match validate_audio_file(path) {
+            Ok(file) => file,
+            Err(err) => {
+                if should_stop_now(controller, shutdown) {
+                    return Ok(stop_before_worker(
+                        controller,
+                        shared_output.take(),
+                        AudioStreamInfo::uninitialized(),
+                        OutputDeviceInfo::uninitialized(),
+                        on_event,
+                    ));
+                }
+                if controller.take_track_switch() {
+                    return Ok(TrackWaitOutcome::SwitchTrack);
+                }
+                return Err(fail_and_emit(controller, err, on_event));
             }
-            if controller.take_track_switch() {
-                return Ok(TrackWaitOutcome::SwitchTrack);
-            }
-            return Err(fail_and_emit(controller, err, on_event));
+        };
+
+        if should_stop_now(controller, shutdown) {
+            return Ok(stop_before_worker(
+                controller,
+                shared_output.take(),
+                AudioStreamInfo::uninitialized(),
+                OutputDeviceInfo::uninitialized(),
+                on_event,
+            ));
         }
+        if controller.take_track_switch() {
+            return Ok(TrackWaitOutcome::SwitchTrack);
+        }
+
+        let decoder = match FlacDecoder::open(&validated.path) {
+            Ok(dec) => dec,
+            Err(err) => {
+                if should_stop_now(controller, shutdown) {
+                    return Ok(stop_before_worker(
+                        controller,
+                        shared_output.take(),
+                        AudioStreamInfo::uninitialized(),
+                        OutputDeviceInfo::uninitialized(),
+                        on_event,
+                    ));
+                }
+                if controller.take_track_switch() {
+                    return Ok(TrackWaitOutcome::SwitchTrack);
+                }
+                return Err(fail_and_emit(controller, err, on_event));
+            }
+        };
+
+        let stream_info = decoder.stream_info().clone();
+        (validated, decoder, stream_info)
     };
 
-    if should_stop_now(controller, shutdown) {
-        return Ok(stop_before_worker(
-            controller,
-            None,
-            AudioStreamInfo::uninitialized(),
-            OutputDeviceInfo::uninitialized(),
-            on_event,
-        ));
-    }
-    if controller.take_track_switch() {
-        return Ok(TrackWaitOutcome::SwitchTrack);
-    }
-
-    let decoder = match FlacDecoder::open(&validated.path) {
-        Ok(dec) => dec,
-        Err(err) => {
-            if should_stop_now(controller, shutdown) {
-                return Ok(stop_before_worker(
-                    controller,
-                    None,
-                    AudioStreamInfo::uninitialized(),
-                    OutputDeviceInfo::uninitialized(),
-                    on_event,
-                ));
-            }
-            if controller.take_track_switch() {
-                return Ok(TrackWaitOutcome::SwitchTrack);
-            }
-            return Err(fail_and_emit(controller, err, on_event));
-        }
-    };
-
-    let stream_info = decoder.stream_info().clone();
     if should_stop_now(controller, shutdown) {
         drop(decoder);
         return Ok(stop_before_worker(
             controller,
-            None,
+            shared_output.take(),
             stream_info,
             OutputDeviceInfo::uninitialized(),
             on_event,
@@ -1343,25 +1501,28 @@ fn play_single_queue_track(
 
     let shared_error = Arc::new(Mutex::new(None));
 
-    let output = match AudioOutput::open_default_with_error_sink(Some(Arc::clone(&shared_error))) {
-        Ok(out) => out,
-        Err(err) => {
-            if should_stop_now(controller, shutdown) {
-                drop(decoder);
-                return Ok(stop_before_worker(
-                    controller,
-                    None,
-                    stream_info,
-                    OutputDeviceInfo::uninitialized(),
-                    on_event,
-                ));
+    let output = match shared_output.take() {
+        Some(out) => out,
+        None => match AudioOutput::open_default_with_error_sink(Some(Arc::clone(&shared_error))) {
+            Ok(out) => out,
+            Err(err) => {
+                if should_stop_now(controller, shutdown) {
+                    drop(decoder);
+                    return Ok(stop_before_worker(
+                        controller,
+                        None,
+                        stream_info,
+                        OutputDeviceInfo::uninitialized(),
+                        on_event,
+                    ));
+                }
+                if controller.take_track_switch() {
+                    drop(decoder);
+                    return Ok(TrackWaitOutcome::SwitchTrack);
+                }
+                return Err(fail_and_emit(controller, err, on_event));
             }
-            if controller.take_track_switch() {
-                drop(decoder);
-                return Ok(TrackWaitOutcome::SwitchTrack);
-            }
-            return Err(fail_and_emit(controller, err, on_event));
-        }
+        },
     };
     let output_info = output.device_info().clone();
 
@@ -1377,7 +1538,7 @@ fn play_single_queue_track(
     }
     if controller.take_track_switch() {
         drop(decoder);
-        drop(output);
+        *shared_output = Some(output);
         return Ok(TrackWaitOutcome::SwitchTrack);
     }
 
@@ -1399,7 +1560,7 @@ fn play_single_queue_track(
     {
         drop(decoder);
         if controller.take_track_switch() && !should_stop_now(controller, shutdown) {
-            drop(output);
+            *shared_output = Some(output);
             return Ok(TrackWaitOutcome::SwitchTrack);
         }
         return Ok(TrackWaitOutcome::Stopped(finish_with_stop(
@@ -1435,7 +1596,7 @@ fn play_single_queue_track(
         Ok(Some(chunk)) => chunk,
         Ok(None) => {
             if controller.take_track_switch() && !should_stop_now(controller, shutdown) {
-                drop(output);
+                *shared_output = Some(output);
                 join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
                 return Ok(TrackWaitOutcome::SwitchTrack);
             }
@@ -1474,7 +1635,7 @@ fn play_single_queue_track(
         Ok(true) => {}
         Ok(false) => {
             if controller.take_track_switch() && !should_stop_now(controller, shutdown) {
-                drop(output);
+                *shared_output = Some(output);
                 join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
                 return Ok(TrackWaitOutcome::SwitchTrack);
             }
@@ -1502,6 +1663,7 @@ fn play_single_queue_track(
     wait_for_playback(
         controller,
         output,
+        shared_output,
         decoder_handle,
         channels,
         sample_rate,
@@ -1520,6 +1682,7 @@ fn play_single_queue_track(
 fn wait_for_playback(
     controller: &PlaybackController,
     output: AudioOutput,
+    shared_output: &mut Option<AudioOutput>,
     decoder_handle: JoinHandle<()>,
     channels: ChannelCount,
     sample_rate: SampleRate,
@@ -1532,6 +1695,8 @@ fn wait_for_playback(
     shared_error: Arc<Mutex<Option<AudioError>>>,
     on_event: &mut impl FnMut(PlaybackEvent),
 ) -> Result<TrackWaitOutcome, AudioError> {
+    let mut next_preloaded = false;
+
     loop {
         if let Some(new_done) =
             controller.complete_ready_seek_if_any(channels, sample_rate, stream_info.duration)
@@ -1554,7 +1719,7 @@ fn wait_for_playback(
         }
 
         if controller.take_track_switch() {
-            drop(output);
+            *shared_output = Some(output);
             join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
             return Ok(TrackWaitOutcome::SwitchTrack);
         }
@@ -1566,6 +1731,15 @@ fn wait_for_playback(
             controller.drain_pending_events(on_event);
             on_event(PlaybackEvent::StateChanged(PlaybackState::Error));
             return Err(err);
+        }
+
+        if !next_preloaded
+            && !controller.is_next_track_preloaded()
+            && controller.peek_next_track().is_some()
+        {
+            if let Ok(true) = controller.preload_next_track() {
+                next_preloaded = true;
+            }
         }
 
         if controller.is_ready_to_finish_playing() && decoder_done.load(Ordering::Acquire) {
@@ -1594,7 +1768,7 @@ fn wait_for_playback(
             }
 
             if controller.take_track_switch() {
-                drop(output);
+                *shared_output = Some(output);
                 join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
                 return Ok(TrackWaitOutcome::SwitchTrack);
             }
@@ -1610,7 +1784,7 @@ fn wait_for_playback(
             match controller.finish_ended_or_advance() {
                 TrackEndOutcome::StillPlaying => {}
                 TrackEndOutcome::NextTrack => {
-                    drop(output);
+                    *shared_output = Some(output);
                     join_decoder_worker(decoder_handle, &stop_decoder, Some(&seek_coordinator));
                     return Ok(TrackWaitOutcome::SwitchTrack);
                 }
@@ -2508,5 +2682,83 @@ mod tests {
         let awaited = handle.join().unwrap();
         assert_eq!(awaited.revision, 5);
         assert!(awaited.muted);
+    }
+
+    #[test]
+    fn preloads_consecutive_track_off_audio_thread_and_detects_compatibility() {
+        let fixture_a = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("sine_16bit_44100_stereo.flac");
+        let fixture_b = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("sine_24bit_48000_stereo.flac");
+
+        let preloaded_a = PreloadedTrack::preload(&fixture_a).expect("preload a should succeed");
+        assert_eq!(preloaded_a.stream_info.sample_rate, 44_100);
+        assert_eq!(preloaded_a.stream_info.channels, 2);
+
+        let preloaded_b = PreloadedTrack::preload(&fixture_b).expect("preload b should succeed");
+        assert_eq!(preloaded_b.stream_info.sample_rate, 48_000);
+        assert_eq!(preloaded_b.stream_info.channels, 2);
+
+        assert!(preloaded_a.is_format_compatible(&preloaded_a.stream_info));
+        assert!(!preloaded_a.is_format_compatible(&preloaded_b.stream_info));
+
+        let controller = PlaybackController::new();
+        let queue = TrackQueue::new(vec![fixture_a.clone(), fixture_b.clone()]);
+        controller.begin_loading_with_queue(queue).unwrap();
+
+        assert!(!controller.is_next_track_preloaded());
+        assert_eq!(controller.peek_next_track(), Some(fixture_b.clone()));
+
+        // Preload next track
+        assert!(controller.preload_next_track().unwrap());
+        assert!(controller.is_next_track_preloaded());
+        assert_eq!(
+            controller.preloaded_stream_info().map(|s| s.sample_rate),
+            Some(48_000)
+        );
+        let snap = controller.snapshot();
+        assert!(snap.is_next_preloaded);
+
+        // Preloading again when already preloaded is a no-op
+        assert!(!controller.preload_next_track().unwrap());
+
+        // Taking preloaded track matches path
+        let taken = controller.take_preloaded_track_if_matches(&fixture_b);
+        assert!(taken.is_some());
+        assert!(!controller.is_next_track_preloaded());
+
+        // Preload again and verify clear_preloaded_track
+        assert!(controller.preload_next_track().unwrap());
+        assert!(controller.is_next_track_preloaded());
+        controller.clear_preloaded_track();
+        assert!(!controller.is_next_track_preloaded());
+    }
+
+    #[test]
+    fn preloaded_track_is_cleared_on_stop_or_manual_navigation() {
+        let fixture_a = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("sine_16bit_44100_stereo.flac");
+        let fixture_b = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("sine_24bit_48000_stereo.flac");
+
+        let controller = PlaybackController::new();
+        let queue = TrackQueue::new(vec![fixture_a, fixture_b]);
+        controller.begin_loading_with_queue(queue).unwrap();
+
+        controller.preload_next_track().unwrap();
+        assert!(controller.is_next_track_preloaded());
+
+        // Stop clears preloaded track
+        controller.set_state_for_test(PlaybackState::Playing);
+        controller.stop().unwrap();
+        assert!(!controller.is_next_track_preloaded());
     }
 }

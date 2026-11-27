@@ -468,8 +468,13 @@ fn print_snapshot_status(snapshot: &crate::audio::PlaybackSnapshot) {
         (Some(idx), count) if count > 1 => format!(" [{}/{}]", idx + 1, count),
         _ => String::new(),
     };
+    let preload_label = if snapshot.is_next_preloaded {
+        " [next preloaded]"
+    } else {
+        ""
+    };
     println!(
-        "Status:  {} | {}/{} | Vol {} | {track_label}{queue_label} (rev {})",
+        "Status:  {} | {}/{} | Vol {} | {track_label}{queue_label}{preload_label} (rev {})",
         snapshot.state,
         format_duration(snapshot.position),
         total,

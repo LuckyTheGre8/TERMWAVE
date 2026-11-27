@@ -112,6 +112,46 @@ impl TrackQueue {
         !self.back_stack.is_empty() || self.current_index.is_some_and(|idx| idx > 0)
     }
 
+    /// Returns the path of the next upcoming track without advancing the queue cursor.
+    pub fn peek_next(&self) -> Option<&Path> {
+        self.current_index
+            .and_then(|idx| idx.checked_add(1))
+            .and_then(|idx| self.tracks.get(idx))
+            .map(PathBuf::as_path)
+    }
+
+    /// Returns the 0-based index of the next upcoming track, if any.
+    pub fn peek_next_index(&self) -> Option<usize> {
+        self.current_index
+            .and_then(|idx| idx.checked_add(1))
+            .filter(|&idx| idx < self.tracks.len())
+    }
+
+    /// Returns the path of the previous track in history without modifying the queue cursor.
+    pub fn peek_previous(&self) -> Option<&Path> {
+        if let Some(&prev) = self.back_stack.back() {
+            self.tracks.get(prev).map(PathBuf::as_path)
+        } else {
+            self.current_index
+                .and_then(|idx| idx.checked_sub(1))
+                .and_then(|idx| self.tracks.get(idx))
+                .map(PathBuf::as_path)
+        }
+    }
+
+    /// Returns the remaining upcoming tracks after the active track.
+    pub fn remaining_tracks(&self) -> &[PathBuf] {
+        match self.current_index {
+            Some(idx) if idx + 1 < self.tracks.len() => &self.tracks[idx + 1..],
+            _ => &[],
+        }
+    }
+
+    /// Returns `true` if indices `a` and `b` represent consecutive positions in the queue.
+    pub fn is_consecutive(&self, a: usize, b: usize) -> bool {
+        a.checked_add(1) == Some(b) && b < self.tracks.len()
+    }
+
     /// Advances to the next track in the queue and records the current track
     /// in playback history.
     ///
@@ -312,5 +352,33 @@ mod tests {
             queue.step_previous(),
             Err(AudioError::InvalidState(_))
         ));
+    }
+
+    #[test]
+    fn inspects_consecutive_lookahead_and_remaining_tracks() {
+        let mut queue = TrackQueue::new(sample_tracks());
+        assert_eq!(queue.peek_next(), Some(Path::new("track2.flac")));
+        assert_eq!(queue.peek_next_index(), Some(1));
+        assert_eq!(queue.peek_previous(), None);
+        assert_eq!(
+            queue.remaining_tracks(),
+            &[PathBuf::from("track2.flac"), PathBuf::from("track3.flac")]
+        );
+        assert!(queue.is_consecutive(0, 1));
+        assert!(queue.is_consecutive(1, 2));
+        assert!(!queue.is_consecutive(0, 2));
+        assert!(!queue.is_consecutive(2, 3));
+
+        queue.advance_next().unwrap();
+        assert_eq!(queue.peek_next(), Some(Path::new("track3.flac")));
+        assert_eq!(queue.peek_next_index(), Some(2));
+        assert_eq!(queue.peek_previous(), Some(Path::new("track1.flac")));
+        assert_eq!(queue.remaining_tracks(), &[PathBuf::from("track3.flac")]);
+
+        queue.advance_next().unwrap();
+        assert_eq!(queue.peek_next(), None);
+        assert_eq!(queue.peek_next_index(), None);
+        assert_eq!(queue.peek_previous(), Some(Path::new("track2.flac")));
+        assert!(queue.remaining_tracks().is_empty());
     }
 }

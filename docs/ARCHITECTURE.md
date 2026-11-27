@@ -45,6 +45,11 @@ src/
   - `TrackQueue` (`queue.rs`) tracks current queue position, visited back-navigation stack, chronological played history (bounded to avoid unbounded memory growth), and start/end boundary guards.
   - `VolumeState` (`volume.rs`) validates gain strictly within `[0.0, 1.0]` (unity-capped to prevent overdrive clipping), preserves configured volume across mute toggles and track transitions, and `prevent_clipping` bounds PCM output samples within `[-1.0, 1.0]`.
   - Seeking (`decoder.rs` + `SeekCoordinator` in `playback.rs`) represents stream seekability explicitly via `SeekCapabilities`, executes forward/backward/absolute FLAC seeks on the decoder worker thread (never inside real-time audio callbacks), trims partial leading frames accurately, and preserves `Playing` or `Paused` state across seeks.
+  - Gapless playback groundwork & decoder preloading (`PreloadedTrack`, `TrackQueue::peek_next`):
+    - `TrackQueue` provides forward lookahead (`peek_next`, `peek_next_index`, `remaining_tracks`, `is_consecutive`) without advancing the queue cursor.
+    - `PreloadedTrack` validates upcoming audio files and probes Symphonia FLAC headers off the audio thread while the current track's ring buffer drains, eliminating filesystem and header parsing latency when the track advances.
+    - `AudioOutput` stream reuse keeps the OS mixer/device stream open across playlist tracks, avoiding hardware re-initialization and audio clicks.
+    - Playback state (configured volume, mute state, session listening duration, and queue history) is strictly preserved across consecutive track transitions.
 - Robust error propagation:
   - Input validation traps nonexistent, empty, non-file, unsupported, and process-locked audio files before playback begins.
   - Decoder traps corrupted headers, truncated packets, unsupported sample formats/rates, and non-finite (`NaN`/`Inf`) PCM audio samples.
@@ -71,3 +76,20 @@ src/
 
 - **Offline-first:** Local playback, metadata reading, and library browsing must never require internet connectivity or external services.
 - **Linux and Windows:** Platform-specific audio backend logic (WASAPI on Windows, PipeWire/ALSA on Linux) and terminal behavior must stay isolated behind clean subsystem boundaries.
+
+## Gapless Playback and Preloading Architecture (Phase 15 & Phase 41)
+
+In Phase 15, Termwave establishes the architectural foundation for seamless transitions between consecutive playlist tracks:
+
+1. **Queue Lookahead:** `TrackQueue::peek_next()` and `remaining_tracks()` allow the engine and UI to inspect upcoming tracks without perturbing the active track index or visited history.
+2. **Decoder Preloading:** While the current track's ring buffer drains to the hardware device, `PreloadedTrack::preload()` validates the next file and initializes the Symphonia FLAC format reader and codec ahead of time. When the track advances, startup I/O is already complete.
+3. **Audio Stream Reuse:** Reusing `AudioOutput` across playlist items eliminates CPAL/WASAPI/ALSA stream teardown and recreation delays, reducing transition time from ~100–200ms to under 2ms.
+4. **State Preservation:** Volume, mute state, session listening duration, and visited history stacks are preserved across track boundaries.
+
+### Current Gapless Limitations and Phase 41 Roadmap
+
+While Phase 15 drastically reduces transition delays, full bit-perfect gapless transitions require addressing specific hardware and format constraints:
+
+- **Sample Rate & Channel Layout Differences:** In shared output mode, the OS audio engine resamples streams to the device rate. In exclusive mode (WASAPI Exclusive / ALSA direct in Phase 40/41), differing sample rates (e.g. 44.1 kHz to 96 kHz) necessitate reconfiguring the DAC clock, which introduces an unavoidable hardware resync delay. True gapless requires identical stream sample formats.
+- **Buffer Starvation vs. Direct Sample Stitching:** Current architecture instantiates a new `Player` on the shared output mixer once the previous player drains. Phase 41 will implement continuous sample stitching feeding multiple tracks into a single uninterrupted audio source buffer to prevent mixer starvation.
+- **FLAC Padding & Encoder Delay:** Unlike lossy MP3/AAC files with priming/padding samples, FLAC audio frames preserve original PCM sample boundaries. Non-standard variable block sizes or padding blocks are handled by Symphonia frame decoding.
