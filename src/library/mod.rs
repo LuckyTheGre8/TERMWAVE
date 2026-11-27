@@ -4,12 +4,14 @@
 //! favorites, and playback history. Single-file playback must never depend
 //! on this subsystem.
 
+pub mod db;
 pub mod scanner;
 
 use std::path::PathBuf;
 
 use thiserror::Error;
 
+pub use db::{AlbumRecord, ArtistRecord, LibraryDatabase, NewTrackRecord, TrackRecord};
 pub use scanner::{
     BackgroundScanHandle, ScanOptions, ScanProgress, ScanSummary, ScanWarning, ScannedAudioFormat,
     ScannedTrack, scan_directories, scan_directory, spawn_directory_scan,
@@ -34,6 +36,14 @@ pub enum LibraryError {
     /// Permission denied accessing a scan root directory.
     #[error("permission denied accessing directory: {path}")]
     PermissionDenied { path: PathBuf },
+
+    /// Database migration failed.
+    #[error("library migration failed at version {version}: {message}")]
+    MigrationFailed { version: u32, message: String },
+
+    /// SQLite database operation failed.
+    #[error("library database error: {0}")]
+    Database(#[from] rusqlite::Error),
 
     /// Underlying I/O error during library operations.
     #[error("library I/O error: {0}")]

@@ -66,12 +66,16 @@ src/
 - Resilient tag parsing: handles missing metadata and malformed tag/date strings gracefully via `extract_metadata_or_default` so playback never fails due to tagging errors.
 - Integrates with `PlaybackTrackInfo` and `PreloadedTrack` so metadata and lightweight `ArtworkSummary` extraction happen ahead of time during background preloading.
 
-### `library` (`src/library/mod.rs`, `src/library/scanner.rs`)
-- Owns recursive directory scanning (`walkdir`), SQLite indexing, search, favorites, and playback history.
+### `library` (`src/library/mod.rs`, `src/library/scanner.rs`, `src/library/db.rs`)
+- Owns recursive directory scanning (`walkdir`), SQLite persistence (`rusqlite` bundled), indexing, search, favorites, and playback history.
 - Directory scanning (`scanner.rs`):
   - Recursively scans one or more root directories via `scan_directory` / `scan_directories`, identifying supported formats (`FLAC`), ignoring irrelevant/hidden/empty files, and optionally verifying leading container magic bytes.
   - Records non-fatal `ScanWarning`s for inaccessible subdirectories or unreadable entries without aborting the scan.
   - Supports non-blocking background traversal via `spawn_directory_scan` (`BackgroundScanHandle`) with live atomic `ScanProgress` counters and cooperative cancellation so scanning never blocks the playback engine.
+- SQLite persistence (`db.rs`):
+  - `LibraryDatabase` manages persistent (`open`) and ephemeral (`open_in_memory`) SQLite connections with WAL mode, busy timeout, and `PRAGMA foreign_keys = ON`.
+  - Versioned transactional migrations (`schema_migrations`) establish `artists`, `albums`, and `tracks` tables with appropriate indexes and uniqueness constraints.
+  - Exposes typed CRUD/upsert operations (`upsert_artist`, `upsert_album`, `upsert_track`, `get_*`, `list_*`, `delete_track_by_path`, `with_transaction`) to prevent duplicate entries.
 - Basic single-file playback must work independently without requiring the library database.
 
 ### `config` (`src/config.rs`)

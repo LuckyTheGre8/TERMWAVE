@@ -12,8 +12,9 @@ pub mod library;
 pub mod metadata;
 
 pub use library::{
-    BackgroundScanHandle, LibraryError, ScanOptions, ScanProgress, ScanSummary, ScanWarning,
-    ScannedAudioFormat, ScannedTrack, scan_directories, scan_directory, spawn_directory_scan,
+    AlbumRecord, ArtistRecord, BackgroundScanHandle, LibraryDatabase, LibraryError, NewTrackRecord,
+    ScanOptions, ScanProgress, ScanSummary, ScanWarning, ScannedAudioFormat, ScannedTrack,
+    TrackRecord, scan_directories, scan_directory, spawn_directory_scan,
 };
 pub use metadata::{
     ArtworkDimensions, ArtworkExtractOptions, ArtworkFormat, ArtworkRole, ArtworkSummary,
