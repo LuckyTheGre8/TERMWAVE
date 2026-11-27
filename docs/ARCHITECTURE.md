@@ -66,7 +66,7 @@ src/
 - Resilient tag parsing: handles missing metadata and malformed tag/date strings gracefully via `extract_metadata_or_default` so playback never fails due to tagging errors.
 - Integrates with `PlaybackTrackInfo` and `PreloadedTrack` so metadata and lightweight `ArtworkSummary` extraction happen ahead of time during background preloading.
 
-### `library` (`src/library/mod.rs`, `src/library/scanner.rs`, `src/library/db.rs`)
+### `library` (`src/library/mod.rs`, `src/library/scanner.rs`, `src/library/db.rs`, `src/library/indexer.rs`)
 - Owns recursive directory scanning (`walkdir`), SQLite persistence (`rusqlite` bundled), indexing, search, favorites, and playback history.
 - Directory scanning (`scanner.rs`):
   - Recursively scans one or more root directories via `scan_directory` / `scan_directories`, identifying supported formats (`FLAC`), ignoring irrelevant/hidden/empty files, and optionally verifying leading container magic bytes.
@@ -76,6 +76,9 @@ src/
   - `LibraryDatabase` manages persistent (`open`) and ephemeral (`open_in_memory`) SQLite connections with WAL mode, busy timeout, and `PRAGMA foreign_keys = ON`.
   - Versioned transactional migrations (`schema_migrations`) establish `artists`, `albums`, and `tracks` tables with appropriate indexes and uniqueness constraints.
   - Exposes typed CRUD/upsert operations (`upsert_artist`, `upsert_album`, `upsert_track`, `get_*`, `list_*`, `delete_track_by_path`, `with_transaction`) to prevent duplicate entries.
+- Library indexing (`indexer.rs`):
+  - `index_directory`, `rescan_library`, and `index_scan_summary` atomically index discovered tracks inside SQLite transactions.
+  - Normalizes paths and deduplicates scan batches, skips unchanged files (`file_size` + `last_modified`), re-extracts metadata for modified files, reconciles moved/renamed files in-place (preserving track IDs and `date_added`), prunes deleted tracks under scanned roots, and cleans up orphaned albums/artists.
 - Basic single-file playback must work independently without requiring the library database.
 
 ### `config` (`src/config.rs`)

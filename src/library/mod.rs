@@ -5,6 +5,7 @@
 //! on this subsystem.
 
 pub mod db;
+pub mod indexer;
 pub mod scanner;
 
 use std::path::PathBuf;
@@ -12,6 +13,9 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 pub use db::{AlbumRecord, ArtistRecord, LibraryDatabase, NewTrackRecord, TrackRecord};
+pub use indexer::{
+    IndexOptions, IndexSummary, index_directory, index_scan_summary, rescan_library,
+};
 pub use scanner::{
     BackgroundScanHandle, ScanOptions, ScanProgress, ScanSummary, ScanWarning, ScannedAudioFormat,
     ScannedTrack, scan_directories, scan_directory, spawn_directory_scan,

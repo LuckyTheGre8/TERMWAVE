@@ -269,22 +269,7 @@ impl LibraryDatabase {
 
     /// Inserts or retrieves an artist by exact name.
     pub fn upsert_artist(&self, name: &str) -> Result<ArtistRecord, LibraryError> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO artists (name) VALUES (?1)",
-            params![name],
-        )?;
-        self.conn
-            .query_row(
-                "SELECT id, name FROM artists WHERE name = ?1",
-                params![name],
-                |row| {
-                    Ok(ArtistRecord {
-                        id: row.get(0)?,
-                        name: row.get(1)?,
-                    })
-                },
-            )
-            .map_err(LibraryError::from)
+        upsert_artist_conn(&self.conn, name)
     }
 
     /// Retrieves an artist by primary key.
@@ -327,65 +312,12 @@ impl LibraryDatabase {
         release_year: Option<u32>,
         artwork_ref: Option<&str>,
     ) -> Result<AlbumRecord, LibraryError> {
-        let existing_id: Option<i64> = match artist_id {
-            Some(aid) => self
-                .conn
-                .query_row(
-                    "SELECT id FROM albums WHERE name = ?1 AND artist_id = ?2",
-                    params![name, aid],
-                    |row| row.get(0),
-                )
-                .optional()?,
-            None => self
-                .conn
-                .query_row(
-                    "SELECT id FROM albums WHERE name = ?1 AND artist_id IS NULL",
-                    params![name],
-                    |row| row.get(0),
-                )
-                .optional()?,
-        };
-
-        let album_id = if let Some(id) = existing_id {
-            self.conn.execute(
-                "UPDATE albums
-                 SET release_year = COALESCE(?1, release_year),
-                     artwork_ref = COALESCE(?2, artwork_ref)
-                 WHERE id = ?3",
-                params![release_year, artwork_ref, id],
-            )?;
-            id
-        } else {
-            self.conn.execute(
-                "INSERT INTO albums (name, artist_id, release_year, artwork_ref)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![name, artist_id, release_year, artwork_ref],
-            )?;
-            self.conn.last_insert_rowid()
-        };
-
-        self.get_album_by_id(album_id)?
-            .ok_or_else(|| LibraryError::Unavailable("inserted album missing".to_string()))
+        upsert_album_conn(&self.conn, name, artist_id, release_year, artwork_ref)
     }
 
     /// Retrieves an album by primary key.
     pub fn get_album_by_id(&self, id: i64) -> Result<Option<AlbumRecord>, LibraryError> {
-        self.conn
-            .query_row(
-                "SELECT id, name, artist_id, release_year, artwork_ref FROM albums WHERE id = ?1",
-                params![id],
-                |row| {
-                    Ok(AlbumRecord {
-                        id: row.get(0)?,
-                        name: row.get(1)?,
-                        artist_id: row.get(2)?,
-                        release_year: row.get(3)?,
-                        artwork_ref: row.get(4)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(LibraryError::from)
+        get_album_by_id_conn(&self.conn, id)
     }
 
     /// Lists all albums ordered by name.
@@ -408,63 +340,7 @@ impl LibraryDatabase {
 
     /// Inserts a new track or updates an existing track matching `source_path`.
     pub fn upsert_track(&self, track: &NewTrackRecord) -> Result<TrackRecord, LibraryError> {
-        let now = unix_timestamp_secs();
-        let duration_ms = track.duration_ms.map(|d| d as i64);
-        let file_size = track.file_size as i64;
-
-        self.conn.execute(
-            "INSERT INTO tracks (
-                source_path, title, artist, album, album_artist,
-                artist_id, album_id, genre, duration_ms, codec,
-                sample_rate, bit_depth, channels, file_size,
-                track_number, disc_number, date_added, last_modified
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5,
-                ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18
-            )
-            ON CONFLICT(source_path) DO UPDATE SET
-                title = excluded.title,
-                artist = excluded.artist,
-                album = excluded.album,
-                album_artist = excluded.album_artist,
-                artist_id = excluded.artist_id,
-                album_id = excluded.album_id,
-                genre = excluded.genre,
-                duration_ms = excluded.duration_ms,
-                codec = excluded.codec,
-                sample_rate = excluded.sample_rate,
-                bit_depth = excluded.bit_depth,
-                channels = excluded.channels,
-                file_size = excluded.file_size,
-                track_number = excluded.track_number,
-                disc_number = excluded.disc_number,
-                last_modified = excluded.last_modified",
-            params![
-                track.source_path,
-                track.title,
-                track.artist,
-                track.album,
-                track.album_artist,
-                track.artist_id,
-                track.album_id,
-                track.genre,
-                duration_ms,
-                track.codec,
-                track.sample_rate,
-                track.bit_depth,
-                track.channels,
-                file_size,
-                track.track_number,
-                track.disc_number,
-                now,
-                track.last_modified,
-            ],
-        )?;
-
-        self.get_track_by_path(&track.source_path)?
-            .ok_or_else(|| LibraryError::Unavailable("upserted track missing".to_string()))
+        upsert_track_conn(&self.conn, track)
     }
 
     /// Retrieves a track by primary key.
@@ -488,34 +364,12 @@ impl LibraryDatabase {
         &self,
         source_path: &str,
     ) -> Result<Option<TrackRecord>, LibraryError> {
-        self.conn
-            .query_row(
-                "SELECT id, source_path, title, artist, album, album_artist,
-                        artist_id, album_id, genre, duration_ms, codec,
-                        sample_rate, bit_depth, channels, file_size,
-                        track_number, disc_number, date_added, last_modified
-                 FROM tracks WHERE source_path = ?1",
-                params![source_path],
-                row_to_track_record,
-            )
-            .optional()
-            .map_err(LibraryError::from)
+        get_track_by_path_conn(&self.conn, source_path)
     }
 
     /// Lists all tracks ordered by album, disc, track number, and title/path.
     pub fn list_tracks(&self) -> Result<Vec<TrackRecord>, LibraryError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, source_path, title, artist, album, album_artist,
-                    artist_id, album_id, genre, duration_ms, codec,
-                    sample_rate, bit_depth, channels, file_size,
-                    track_number, disc_number, date_added, last_modified
-             FROM tracks
-             ORDER BY COALESCE(album, ''), COALESCE(disc_number, 0),
-                      COALESCE(track_number, 0), COALESCE(title, source_path)",
-        )?;
-        let rows = stmt.query_map([], row_to_track_record)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(LibraryError::from)
+        list_tracks_conn(&self.conn)
     }
 
     /// Deletes a track matching `source_path`, returning `true` if a row was removed.
@@ -550,6 +404,226 @@ impl LibraryDatabase {
             .query_row("SELECT COUNT(*) FROM artists", [], |row| row.get(0))?;
         Ok(count.max(0) as usize)
     }
+}
+
+pub(crate) fn upsert_artist_conn(
+    conn: &Connection,
+    name: &str,
+) -> Result<ArtistRecord, LibraryError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO artists (name) VALUES (?1)",
+        params![name],
+    )?;
+    conn.query_row(
+        "SELECT id, name FROM artists WHERE name = ?1",
+        params![name],
+        |row| {
+            Ok(ArtistRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+            })
+        },
+    )
+    .map_err(LibraryError::from)
+}
+
+pub(crate) fn get_album_by_id_conn(
+    conn: &Connection,
+    id: i64,
+) -> Result<Option<AlbumRecord>, LibraryError> {
+    conn.query_row(
+        "SELECT id, name, artist_id, release_year, artwork_ref FROM albums WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(AlbumRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                artist_id: row.get(2)?,
+                release_year: row.get(3)?,
+                artwork_ref: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(LibraryError::from)
+}
+
+pub(crate) fn upsert_album_conn(
+    conn: &Connection,
+    name: &str,
+    artist_id: Option<i64>,
+    release_year: Option<u32>,
+    artwork_ref: Option<&str>,
+) -> Result<AlbumRecord, LibraryError> {
+    let existing_id: Option<i64> = match artist_id {
+        Some(aid) => conn
+            .query_row(
+                "SELECT id FROM albums WHERE name = ?1 AND artist_id = ?2",
+                params![name, aid],
+                |row| row.get(0),
+            )
+            .optional()?,
+        None => conn
+            .query_row(
+                "SELECT id FROM albums WHERE name = ?1 AND artist_id IS NULL",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?,
+    };
+
+    let album_id = if let Some(id) = existing_id {
+        conn.execute(
+            "UPDATE albums
+             SET release_year = COALESCE(?1, release_year),
+                 artwork_ref = COALESCE(?2, artwork_ref)
+             WHERE id = ?3",
+            params![release_year, artwork_ref, id],
+        )?;
+        id
+    } else {
+        conn.execute(
+            "INSERT INTO albums (name, artist_id, release_year, artwork_ref)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![name, artist_id, release_year, artwork_ref],
+        )?;
+        conn.last_insert_rowid()
+    };
+
+    get_album_by_id_conn(conn, album_id)?
+        .ok_or_else(|| LibraryError::Unavailable("inserted album missing".to_string()))
+}
+
+pub(crate) fn upsert_track_conn(
+    conn: &Connection,
+    track: &NewTrackRecord,
+) -> Result<TrackRecord, LibraryError> {
+    let now = unix_timestamp_secs();
+    let duration_ms = track.duration_ms.map(|d| d as i64);
+    let file_size = track.file_size as i64;
+
+    conn.execute(
+        "INSERT INTO tracks (
+            source_path, title, artist, album, album_artist,
+            artist_id, album_id, genre, duration_ms, codec,
+            sample_rate, bit_depth, channels, file_size,
+            track_number, disc_number, date_added, last_modified
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5,
+            ?6, ?7, ?8, ?9, ?10,
+            ?11, ?12, ?13, ?14,
+            ?15, ?16, ?17, ?18
+        )
+        ON CONFLICT(source_path) DO UPDATE SET
+            title = excluded.title,
+            artist = excluded.artist,
+            album = excluded.album,
+            album_artist = excluded.album_artist,
+            artist_id = excluded.artist_id,
+            album_id = excluded.album_id,
+            genre = excluded.genre,
+            duration_ms = excluded.duration_ms,
+            codec = excluded.codec,
+            sample_rate = excluded.sample_rate,
+            bit_depth = excluded.bit_depth,
+            channels = excluded.channels,
+            file_size = excluded.file_size,
+            track_number = excluded.track_number,
+            disc_number = excluded.disc_number,
+            last_modified = excluded.last_modified",
+        params![
+            track.source_path,
+            track.title,
+            track.artist,
+            track.album,
+            track.album_artist,
+            track.artist_id,
+            track.album_id,
+            track.genre,
+            duration_ms,
+            track.codec,
+            track.sample_rate,
+            track.bit_depth,
+            track.channels,
+            file_size,
+            track.track_number,
+            track.disc_number,
+            now,
+            track.last_modified,
+        ],
+    )?;
+
+    get_track_by_path_conn(conn, &track.source_path)?
+        .ok_or_else(|| LibraryError::Unavailable("upserted track missing".to_string()))
+}
+
+pub(crate) fn get_track_by_path_conn(
+    conn: &Connection,
+    source_path: &str,
+) -> Result<Option<TrackRecord>, LibraryError> {
+    conn.query_row(
+        "SELECT id, source_path, title, artist, album, album_artist,
+                artist_id, album_id, genre, duration_ms, codec,
+                sample_rate, bit_depth, channels, file_size,
+                track_number, disc_number, date_added, last_modified
+         FROM tracks WHERE source_path = ?1",
+        params![source_path],
+        row_to_track_record,
+    )
+    .optional()
+    .map_err(LibraryError::from)
+}
+
+pub(crate) fn list_tracks_conn(conn: &Connection) -> Result<Vec<TrackRecord>, LibraryError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, source_path, title, artist, album, album_artist,
+                artist_id, album_id, genre, duration_ms, codec,
+                sample_rate, bit_depth, channels, file_size,
+                track_number, disc_number, date_added, last_modified
+         FROM tracks
+         ORDER BY COALESCE(album, ''), COALESCE(disc_number, 0),
+                  COALESCE(track_number, 0), COALESCE(title, source_path)",
+    )?;
+    let rows = stmt.query_map([], row_to_track_record)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(LibraryError::from)
+}
+
+pub(crate) fn update_track_source_path_conn(
+    conn: &Connection,
+    id: i64,
+    new_source_path: &str,
+) -> Result<(), LibraryError> {
+    conn.execute(
+        "UPDATE tracks SET source_path = ?1 WHERE id = ?2",
+        params![new_source_path, id],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn delete_track_by_id_conn(conn: &Connection, id: i64) -> Result<bool, LibraryError> {
+    let affected = conn.execute("DELETE FROM tracks WHERE id = ?1", params![id])?;
+    Ok(affected > 0)
+}
+
+pub(crate) fn prune_orphaned_albums_and_artists_conn(
+    conn: &Connection,
+) -> Result<(usize, usize), LibraryError> {
+    let pruned_albums = conn.execute(
+        "DELETE FROM albums WHERE id NOT IN (
+            SELECT DISTINCT album_id FROM tracks WHERE album_id IS NOT NULL
+        )",
+        [],
+    )?;
+    let pruned_artists = conn.execute(
+        "DELETE FROM artists WHERE id NOT IN (
+            SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL
+            UNION
+            SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL
+        )",
+        [],
+    )?;
+    Ok((pruned_albums, pruned_artists))
 }
 
 fn row_to_track_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRecord> {

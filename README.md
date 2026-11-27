@@ -11,7 +11,7 @@ Termwave is a lightweight, cross-platform, lossless-first terminal Hi-Fi music p
 
 ## Status
 
-Currently at **Phase 19 (SQLite database)** in Stage 3 (Metadata and Music Library) of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play` integrates `lofty` to extract FLAC Vorbis comments and embedded album artwork while gracefully supporting missing tags and malformed metadata without playback failure, alongside consecutive track lookahead, decoder preloading, hardware audio stream reuse, volume/mute state preservation across tracks, centralized state tracking, non-blocking recursive directory scanning (`walkdir`), and a persistent SQLite library (`rusqlite` with versioned migrations and `artists`/`albums`/`tracks` tables). Library indexing follows in Phase 20.
+Currently at **Phase 20 (Library indexing)** in Stage 3 (Metadata and Music Library) of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play` integrates `lofty` to extract FLAC Vorbis comments and embedded album artwork while gracefully supporting missing tags and malformed metadata without playback failure, alongside consecutive track lookahead, decoder preloading, hardware audio stream reuse, volume/mute state preservation across tracks, centralized state tracking, non-blocking recursive directory scanning (`walkdir`), and transactional SQLite library indexing (`rusqlite` with deduplication, change detection, rescanning, move/rename reconciliation, and orphan cleanup). Music search follows in Phase 21.
 
 ## Usage
 
@@ -29,7 +29,7 @@ termwave play --volume 80 <file>
 - `src/cli.rs` — Command-line interface boundary
 - `src/audio/` — Audio engine boundary (`PlaybackState`, `validation`, `decoder`, `output`, `queue`, `volume`, and `playback`)
 - `src/metadata/` — Metadata (`mod.rs`) and embedded artwork (`artwork.rs`) boundary
-- `src/library/` — Music library directory scanning (`scanner.rs`) and SQLite database/migrations (`db.rs`) boundary
+- `src/library/` — Music library directory scanning (`scanner.rs`), SQLite database/migrations (`db.rs`), and library indexing (`indexer.rs`) boundary
 - `src/config.rs` — Configuration boundary
 - `src/error.rs` — Unified `TermwaveError` (`thiserror`) and `Result<T>`
 
