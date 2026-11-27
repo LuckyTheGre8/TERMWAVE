@@ -55,11 +55,16 @@ src/
   - Decoder traps corrupted headers, truncated packets, unsupported sample formats/rates, and non-finite (`NaN`/`Inf`) PCM audio samples.
   - Audio output hooks CPAL stream error callbacks into a thread-safe error sink to report asynchronous device loss (`AudioError::DeviceLost`) and fatal backend faults without dropping audio thread safety.
 
-### `metadata` (`src/metadata.rs`)
-- Integrates `lofty` to extract track tags (`title`, `artist`, `album`, `album_artist`, `track_number`, `track_total`, `disc_number`, `disc_total`, `genre`, `year`, `date`), technical stream properties, and artwork presence.
+### `metadata` (`src/metadata/mod.rs`, `src/metadata/artwork.rs`)
+- Integrates `lofty` to extract track tags (`title`, `artist`, `album`, `album_artist`, `track_number`, `track_total`, `disc_number`, `disc_total`, `genre`, `year`, `date`), technical stream properties, and embedded artwork.
+- Embedded artwork (`artwork.rs`):
+  - Extracts front/back/fallback pictures via `extract_artwork` and `extract_artwork_from_reader`, returning `Ok(None)` cleanly when artwork is absent.
+  - Identifies image formats (`PNG`, `JPEG`, `GIF`, `WebP`, `BMP`, `TIFF`) via magic bytes with MIME-type fallback, and parses pixel dimensions directly from image headers.
+  - Protects memory by pre-scanning FLAC `PICTURE` metadata block sizes and enforcing `ArtworkExtractOptions::max_bytes` (default 8 MiB) before allocating large artwork payloads.
+  - Prepares terminal-compatible rendering via `TerminalArtworkLayout` (aspect-ratio-preserving cell sizing) and `render_placeholder_lines` textual fallbacks.
 - Explicitly distinguishes source audio format properties (codec, sample rate, bit depth, channels) from actual output device properties.
 - Resilient tag parsing: handles missing metadata and malformed tag/date strings gracefully via `extract_metadata_or_default` so playback never fails due to tagging errors.
-- Integrates with `PlaybackTrackInfo` and `PreloadedTrack` so metadata extraction happens ahead of time during background preloading.
+- Integrates with `PlaybackTrackInfo` and `PreloadedTrack` so metadata and lightweight `ArtworkSummary` extraction happen ahead of time during background preloading.
 
 ### `library` (`src/library.rs`)
 - Owns recursive directory scanning, SQLite indexing, search, favorites, and playback history.

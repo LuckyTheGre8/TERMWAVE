@@ -1107,3 +1107,87 @@ fn extracts_and_propagates_metadata_during_flac_playback() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn extracts_embedded_artwork_summary_during_flac_playback() {
+    use lofty::config::{ParseOptions, WriteOptions};
+    use lofty::file::AudioFile;
+    use lofty::flac::FlacFile;
+    use lofty::ogg::OggPictureStorage;
+    use lofty::picture::{MimeType, Picture, PictureInformation, PictureType};
+    use termwave::metadata::{ArtworkDimensions, ArtworkFormat, ArtworkRole};
+
+    let src = fixture_path("sine_16bit_44100_stereo.flac");
+    let temp_dir = std::env::temp_dir().join("termwave_phase17_playback_artwork");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let temp_flac = temp_dir.join("cover_song.flac");
+    fs::copy(&src, &temp_flac).expect("copy fixture to temp");
+
+    let mut png_data = vec![
+        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D',
+        b'R',
+    ];
+    png_data.extend_from_slice(&300u32.to_be_bytes());
+    png_data.extend_from_slice(&300u32.to_be_bytes());
+    png_data.extend_from_slice(&[8, 2, 0, 0, 0]);
+
+    let mut flac_file = FlacFile::read_from(
+        &mut fs::File::open(&temp_flac).unwrap(),
+        ParseOptions::new(),
+    )
+    .unwrap();
+    let cover = Picture::unchecked(png_data)
+        .pic_type(PictureType::CoverFront)
+        .mime_type(MimeType::Png)
+        .description("Album Cover")
+        .build();
+    flac_file
+        .insert_picture(
+            cover,
+            Some(PictureInformation {
+                width: 300,
+                height: 300,
+                color_depth: 24,
+                num_colors: 0,
+            }),
+        )
+        .unwrap();
+    flac_file
+        .save_to_path(&temp_flac, WriteOptions::default())
+        .expect("save flac with cover");
+
+    let controller = PlaybackController::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut loaded_track = None;
+
+    let result = play_local_flac_with_controller(&temp_flac, controller, shutdown, |event| {
+        if let PlaybackEvent::TrackLoaded(info) = event {
+            loaded_track = Some(info);
+        }
+    });
+
+    match result {
+        Ok(summary) => {
+            assert_eq!(summary.final_state, PlaybackState::Ended);
+            let info = loaded_track.expect("track info should be emitted");
+            assert!(info.metadata.has_artwork);
+            let art = info
+                .metadata
+                .artwork
+                .expect("artwork summary should be present");
+            assert_eq!(art.format, ArtworkFormat::Png);
+            assert_eq!(art.role, ArtworkRole::CoverFront);
+            assert_eq!(
+                art.dimensions,
+                Some(ArtworkDimensions {
+                    width: 300,
+                    height: 300
+                })
+            );
+        }
+        Err(AudioError::NoOutputDevice) => {}
+        Err(other) => panic!("unexpected playback error: {other}"),
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

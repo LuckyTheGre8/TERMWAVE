@@ -459,6 +459,9 @@ fn print_track_info(info: &PlaybackTrackInfo, track_index: Option<usize>, track_
         "Output:  {} | {} Hz | {} ch | {}",
         info.output.name, info.output.sample_rate, info.output.channels, info.output.sample_format
     );
+    if let Some(artwork) = &info.metadata.artwork {
+        println!("Artwork: {}", artwork.display_label());
+    }
 }
 
 fn print_snapshot_status(snapshot: &crate::audio::PlaybackSnapshot) {

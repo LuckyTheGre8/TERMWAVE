@@ -1,17 +1,28 @@
 //! Audio metadata and embedded artwork boundary.
 //!
-//! Responsible for extracting tags and technical stream properties while
-//! distinguishing source audio properties from output device properties.
+//! Responsible for extracting tags, technical stream properties, and embedded
+//! album artwork while distinguishing source audio properties from output device
+//! properties.
+
+pub mod artwork;
 
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::path::Path;
 use std::time::Duration;
 
+use lofty::config::ParseOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey};
 use thiserror::Error;
+
+pub use artwork::{
+    ArtworkDimensions, ArtworkExtractOptions, ArtworkFormat, ArtworkRole, ArtworkSummary,
+    DEFAULT_MAX_ARTWORK_BYTES, EmbeddedArtwork, TerminalArtwork, TerminalArtworkLayout,
+    extract_artwork, extract_artwork_from_reader, extract_artwork_or_none, parse_image_dimensions,
+    render_placeholder_lines,
+};
 
 /// Errors produced during metadata or embedded artwork extraction.
 #[derive(Debug, Error)]
@@ -24,6 +35,12 @@ pub enum MetadataError {
     /// Access permission denied.
     #[error("permission denied reading audio file: {path}")]
     PermissionDenied { path: std::path::PathBuf },
+
+    /// Embedded artwork exceeds the configured memory limit.
+    #[error(
+        "embedded artwork ({size_bytes} bytes) exceeds maximum allowed size ({max_bytes} bytes)"
+    )]
+    ArtworkTooLarge { size_bytes: usize, max_bytes: usize },
 
     /// Failed to read metadata tags from an audio source.
     #[error("failed to read metadata: {0}")]
@@ -71,6 +88,8 @@ pub struct TrackMetadata {
     pub bitrate_kbps: Option<u32>,
     /// Whether embedded artwork was detected.
     pub has_artwork: bool,
+    /// Lightweight summary of the primary embedded artwork, if present and within size limits.
+    pub artwork: Option<ArtworkSummary>,
 }
 
 impl TrackMetadata {
@@ -118,41 +137,60 @@ impl TrackMetadata {
 /// Extracts metadata from a local audio file path using Lofty.
 ///
 /// Supports missing metadata, malformed tags, and tracks with partial tag blocks.
+/// Oversized embedded artwork blocks are skipped automatically so text metadata
+/// extraction stays bounded in memory.
 pub fn extract_metadata(path: impl AsRef<Path>) -> Result<TrackMetadata, MetadataError> {
     let path = path.as_ref();
-    let tagged_file = Probe::open(path)
-        .map_err(|err| map_lofty_error(err, path))?
-        .read()
-        .map_err(|err| map_lofty_error(err, path))?;
-
-    Ok(parse_tagged_file(&tagged_file))
+    let file = File::open(path).map_err(|err| map_io_error(err, path))?;
+    extract_metadata_from_file(file, path)
 }
 
 /// Extracts metadata from an open local file and path hint.
-pub fn extract_metadata_from_file(file: File, path: &Path) -> Result<TrackMetadata, MetadataError> {
+pub fn extract_metadata_from_file(
+    mut file: File,
+    path: &Path,
+) -> Result<TrackMetadata, MetadataError> {
+    let oversized_artwork =
+        artwork::check_flac_picture_block_sizes(&mut file, DEFAULT_MAX_ARTWORK_BYTES).is_err();
+    let parse_options = ParseOptions::new().read_cover_art(!oversized_artwork);
+
     let tagged_file = Probe::new(file)
         .guess_file_type()
         .map_err(|err| map_io_error(err, path))?
+        .options(parse_options)
         .read()
         .map_err(|err| map_lofty_error(err, path))?;
 
-    Ok(parse_tagged_file(&tagged_file))
+    let mut meta = parse_tagged_file(&tagged_file);
+    if oversized_artwork {
+        meta.has_artwork = true;
+    }
+    Ok(meta)
 }
 
 /// Extracts metadata from an arbitrary seekable reader.
 pub fn extract_metadata_from_reader<R: Read + Seek>(
     reader: &mut R,
 ) -> Result<TrackMetadata, MetadataError> {
+    let oversized_artwork =
+        artwork::check_flac_picture_block_sizes(reader, DEFAULT_MAX_ARTWORK_BYTES).is_err();
+    let parse_options = ParseOptions::new().read_cover_art(!oversized_artwork);
+
     let tagged_file = Probe::new(reader)
         .guess_file_type()
         .map_err(|err| MetadataError::ReadFailed(err.to_string()))?
+        .options(parse_options)
         .read()
         .map_err(|err| MetadataError::ReadFailed(err.to_string()))?;
 
-    Ok(parse_tagged_file(&tagged_file))
+    let mut meta = parse_tagged_file(&tagged_file);
+    if oversized_artwork {
+        meta.has_artwork = true;
+    }
+    Ok(meta)
 }
 
-fn map_io_error(err: std::io::Error, path: &Path) -> MetadataError {
+pub(crate) fn map_io_error(err: std::io::Error, path: &Path) -> MetadataError {
     match err.kind() {
         std::io::ErrorKind::NotFound => MetadataError::FileNotFound {
             path: path.to_path_buf(),
@@ -164,7 +202,7 @@ fn map_io_error(err: std::io::Error, path: &Path) -> MetadataError {
     }
 }
 
-fn map_lofty_error(err: lofty::error::LoftyError, path: &Path) -> MetadataError {
+pub(crate) fn map_lofty_error(err: lofty::error::LoftyError, path: &Path) -> MetadataError {
     match err.kind() {
         lofty::error::ErrorKind::Io(io_err) => match io_err.kind() {
             std::io::ErrorKind::NotFound => MetadataError::FileNotFound {
@@ -232,9 +270,11 @@ fn parse_tagged_file(tagged_file: &lofty::file::TaggedFile) -> TrackMetadata {
         {
             meta.year = Some(year);
         }
-
-        meta.has_artwork = !tag.pictures().is_empty();
     }
+
+    // 3. Embedded artwork summary
+    meta.artwork = artwork::summarize_tagged_file_artwork(tagged_file);
+    meta.has_artwork = meta.artwork.is_some();
 
     meta
 }
@@ -282,6 +322,7 @@ mod tests {
         assert_eq!(meta16.bits_per_sample, Some(16));
         assert!(meta16.duration.is_some());
         assert!(!meta16.has_artwork);
+        assert!(meta16.artwork.is_none());
 
         let meta24 = extract_metadata(fixture_path("sine_24bit_96000_mono.flac")).unwrap();
         assert_eq!(meta24.sample_rate, Some(96_000));
