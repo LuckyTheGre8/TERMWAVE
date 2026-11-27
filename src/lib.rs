@@ -10,3 +10,5 @@ pub mod config;
 pub mod error;
 pub mod library;
 pub mod metadata;
+
+pub use metadata::{MetadataError, TrackMetadata, extract_metadata, extract_metadata_or_default};

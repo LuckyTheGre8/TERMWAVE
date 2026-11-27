@@ -56,8 +56,10 @@ src/
   - Audio output hooks CPAL stream error callbacks into a thread-safe error sink to report asynchronous device loss (`AudioError::DeviceLost`) and fatal backend faults without dropping audio thread safety.
 
 ### `metadata` (`src/metadata.rs`)
-- Extracts track tags, technical stream properties, and bounded embedded artwork.
+- Integrates `lofty` to extract track tags (`title`, `artist`, `album`, `album_artist`, `track_number`, `track_total`, `disc_number`, `disc_total`, `genre`, `year`, `date`), technical stream properties, and artwork presence.
 - Explicitly distinguishes source audio format properties (codec, sample rate, bit depth, channels) from actual output device properties.
+- Resilient tag parsing: handles missing metadata and malformed tag/date strings gracefully via `extract_metadata_or_default` so playback never fails due to tagging errors.
+- Integrates with `PlaybackTrackInfo` and `PreloadedTrack` so metadata extraction happens ahead of time during background preloading.
 
 ### `library` (`src/library.rs`)
 - Owns recursive directory scanning, SQLite indexing, search, favorites, and playback history.

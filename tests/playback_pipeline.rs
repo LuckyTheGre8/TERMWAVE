@@ -1037,3 +1037,73 @@ fn preloads_next_track_and_transitions_consecutively_without_delay() {
         Err(other) => panic!("unexpected playback error: {other}"),
     }
 }
+
+#[test]
+fn extracts_and_propagates_metadata_during_flac_playback() {
+    use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
+
+    let src = fixture_path("sine_16bit_44100_stereo.flac");
+    let temp_dir = std::env::temp_dir().join("termwave_phase16_meta_test");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let temp_flac = temp_dir.join("tagged_song.flac");
+    fs::copy(&src, &temp_flac).expect("copy fixture to temp");
+
+    let mut tag = Tag::new(TagType::VorbisComments);
+    tag.set_title("Midnight Groove".to_string());
+    tag.set_artist("Acoustic Wave".to_string());
+    tag.set_album("Late Night Sessions".to_string());
+    tag.set_track(7);
+    tag.set_track_total(12);
+    tag.set_disk(1);
+    tag.set_disk_total(1);
+    tag.set_genre("Jazz".to_string());
+    tag.insert_text(ItemKey::AlbumArtist, "Wave Trio".to_string());
+    tag.insert_text(ItemKey::RecordingDate, "2023-04-15".to_string());
+    tag.save_to_path(&temp_flac, lofty::config::WriteOptions::default())
+        .expect("save tags");
+
+    let controller = PlaybackController::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut loaded_track = None;
+
+    let result =
+        play_local_flac_with_controller(&temp_flac, controller.clone(), shutdown, |event| {
+            if let PlaybackEvent::TrackLoaded(info) = event {
+                loaded_track = Some(info);
+            }
+        });
+
+    match result {
+        Ok(summary) => {
+            assert_eq!(summary.final_state, PlaybackState::Ended);
+            let info = loaded_track.expect("track info should be emitted");
+            assert_eq!(info.metadata.title.as_deref(), Some("Midnight Groove"));
+            assert_eq!(info.metadata.artist.as_deref(), Some("Acoustic Wave"));
+            assert_eq!(info.metadata.album.as_deref(), Some("Late Night Sessions"));
+            assert_eq!(info.metadata.album_artist.as_deref(), Some("Wave Trio"));
+            assert_eq!(info.metadata.genre.as_deref(), Some("Jazz"));
+            assert_eq!(info.metadata.track_number, Some(7));
+            assert_eq!(info.metadata.track_total, Some(12));
+            assert_eq!(info.metadata.disc_number, Some(1));
+            assert_eq!(info.metadata.year, Some(2023));
+            assert_eq!(
+                info.metadata.formatted_track_number(),
+                Some("07/12".to_string())
+            );
+            assert_eq!(
+                info.metadata.display_title(&temp_flac),
+                "Midnight Groove — Acoustic Wave"
+            );
+
+            // Verify controller snapshot reflects the same metadata
+            let snap = controller.snapshot();
+            let snap_meta = &snap.track.unwrap().metadata;
+            assert_eq!(snap_meta.title.as_deref(), Some("Midnight Groove"));
+            assert_eq!(snap_meta.artist.as_deref(), Some("Acoustic Wave"));
+        }
+        Err(AudioError::NoOutputDevice) => {}
+        Err(other) => panic!("unexpected playback error: {other}"),
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

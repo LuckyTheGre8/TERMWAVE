@@ -11,7 +11,7 @@ Termwave is a lightweight, cross-platform, lossless-first terminal Hi-Fi music p
 
 ## Status
 
-Currently at **Phase 15 (Gapless playback groundwork)** in Stage 2 (Playback Engine) of the development roadmap in [AGENTS.md](AGENTS.md) — completing **MILESTONE 2: FUNCTIONAL AUDIO ENGINE**. `termwave play` supports consecutive track queue lookahead, decoder preloading (`PreloadedTrack`, `preload_next_track`), hardware audio stream reuse across track boundaries (reducing transition delays from hundreds of milliseconds to under 2ms), volume/mute state preservation across tracks, and centralized playback state tracking. Metadata extraction follows in Phase 16 (Stage 3).
+Currently at **Phase 16 (Metadata extraction)** in Stage 3 (Metadata and Music Library) of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play` integrates `lofty` to extract FLAC Vorbis comments (track title, artist, album, album artist, track number, track total, disc number, disc total, genre, year, date) while gracefully supporting missing tags and malformed metadata without playback failure, alongside consecutive track lookahead, decoder preloading, hardware audio stream reuse, volume/mute state preservation across tracks, and centralized state tracking. Embedded artwork follows in Phase 17.
 
 ## Usage
 

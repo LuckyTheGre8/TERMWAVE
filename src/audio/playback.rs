@@ -76,6 +76,8 @@ pub struct PreloadedTrack {
     pub decoder: FlacDecoder,
     /// Source stream properties extracted during preload.
     pub stream_info: AudioStreamInfo,
+    /// Pre-extracted track tags and metadata.
+    pub metadata: crate::metadata::TrackMetadata,
 }
 
 impl fmt::Debug for PreloadedTrack {
@@ -83,6 +85,7 @@ impl fmt::Debug for PreloadedTrack {
         f.debug_struct("PreloadedTrack")
             .field("file", &self.file)
             .field("stream_info", &self.stream_info)
+            .field("metadata", &self.metadata)
             .finish_non_exhaustive()
     }
 }
@@ -93,10 +96,12 @@ impl PreloadedTrack {
         let file = validate_audio_file(path)?;
         let decoder = FlacDecoder::open(&file.path)?;
         let stream_info = decoder.stream_info().clone();
+        let metadata = crate::metadata::extract_metadata_or_default(&file.path);
         Ok(Self {
             file,
             decoder,
             stream_info,
+            metadata,
         })
     }
 
@@ -1273,10 +1278,13 @@ pub struct PlaybackTrackInfo {
     pub stream: AudioStreamInfo,
     /// Active system audio output properties.
     pub output: OutputDeviceInfo,
+    /// Extracted track tags and technical stream metadata.
+    pub metadata: crate::metadata::TrackMetadata,
 }
 
 /// Lifecycle events emitted during local playback.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum PlaybackEvent {
     /// Playback engine transitioned to a new state.
     StateChanged(PlaybackState),
@@ -1405,8 +1413,8 @@ fn play_single_queue_track(
         return Ok(TrackWaitOutcome::SwitchTrack);
     }
 
-    let (validated, decoder, stream_info) = if let Some(pre) = preloaded {
-        (pre.file, pre.decoder, pre.stream_info)
+    let (validated, decoder, stream_info, metadata) = if let Some(pre) = preloaded {
+        (pre.file, pre.decoder, pre.stream_info, pre.metadata)
     } else {
         let validated = match validate_audio_file(path) {
             Ok(file) => file,
@@ -1460,7 +1468,8 @@ fn play_single_queue_track(
         };
 
         let stream_info = decoder.stream_info().clone();
-        (validated, decoder, stream_info)
+        let metadata = crate::metadata::extract_metadata_or_default(&validated.path);
+        (validated, decoder, stream_info, metadata)
     };
 
     if should_stop_now(controller, shutdown) {
@@ -1546,6 +1555,7 @@ fn play_single_queue_track(
         file: validated,
         stream: stream_info.clone(),
         output: output_info.clone(),
+        metadata,
     };
     controller.set_loaded_track(track_info.clone());
     on_event(PlaybackEvent::TrackLoaded(track_info));

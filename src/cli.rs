@@ -4,7 +4,7 @@
 //! without owning audio decoding, playback, or library internals.
 
 use std::io::{self, BufRead, IsTerminal};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -415,7 +415,7 @@ fn execute_play(
 }
 
 fn print_track_info(info: &PlaybackTrackInfo, track_index: Option<usize>, track_count: usize) {
-    let display_name = file_display_name(&info.file.path);
+    let display_name = info.metadata.display_title(&info.file.path);
     let bit_depth = info
         .stream
         .bits_per_sample
@@ -425,17 +425,27 @@ fn print_track_info(info: &PlaybackTrackInfo, track_index: Option<usize>, track_
         .duration
         .map_or_else(|| "unknown".to_string(), format_duration);
 
+    let album_details = match (&info.metadata.album, info.metadata.year) {
+        (Some(album), Some(year)) => format!(" ({album}, {year})"),
+        (Some(album), None) => format!(" ({album})"),
+        (None, Some(year)) => format!(" ({year})"),
+        (None, None) => String::new(),
+    };
+
     if track_count > 1
         && let Some(idx) = track_index
     {
         println!(
-            "Track:   [{}/{}] {display_name} ({} bytes)",
+            "Track:   [{}/{}] {display_name}{album_details} ({} bytes)",
             idx + 1,
             track_count,
             info.file.size_bytes
         );
     } else {
-        println!("Track:   {display_name} ({} bytes)", info.file.size_bytes);
+        println!(
+            "Track:   {display_name}{album_details} ({} bytes)",
+            info.file.size_bytes
+        );
     }
     println!(
         "Source:  {} | {} Hz | {} | {} | {}",
@@ -454,7 +464,7 @@ fn print_track_info(info: &PlaybackTrackInfo, track_index: Option<usize>, track_
 fn print_snapshot_status(snapshot: &crate::audio::PlaybackSnapshot) {
     let track_label = snapshot.track.as_ref().map_or_else(
         || "none".to_string(),
-        |info| file_display_name(&info.file.path),
+        |info| info.metadata.display_title(&info.file.path),
     );
     let total = snapshot
         .duration
@@ -486,12 +496,6 @@ fn print_snapshot_status(snapshot: &crate::audio::PlaybackSnapshot) {
     }
 }
 
-fn file_display_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
-}
-
 fn format_channels(channels: u16) -> String {
     match channels {
         1 => "1 ch (Mono)".to_string(),
@@ -510,6 +514,8 @@ fn format_duration(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use clap::error::ErrorKind;
 
     use super::*;
