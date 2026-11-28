@@ -26,6 +26,6 @@ pub use metadata::{
     extract_artwork, extract_artwork_or_none, extract_metadata, extract_metadata_or_default,
 };
 pub use tui::{
-    DEFAULT_TICK_RATE, DashboardLayout, FocusRegion, NavSection, TuiError, TuiInputEvent, TuiState,
-    TuiTerminal, render_dashboard, run_tui,
+    DEFAULT_TICK_RATE, DashboardLayout, FocusRegion, LibraryBrowser, ListCursor, NavSection,
+    TuiError, TuiInputEvent, TuiState, TuiTerminal, render_dashboard, run_tui,
 };

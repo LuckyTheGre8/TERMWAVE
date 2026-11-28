@@ -11,7 +11,7 @@ Termwave is a lightweight, cross-platform, lossless-first terminal Hi-Fi music p
 
 ## Status
 
-Currently at **Phase 25 (Main layout)** in **Stage 4 (Terminal User Interface)** of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play` plays local FLAC files with extracted Vorbis comments and artwork metadata, backed by a persistent SQLite library (`rusqlite`) with directory scanning (`walkdir`), indexing, FTS5/indexed search, favorites, and batched playback history, while `termwave tui` initializes Ratatui + Crossterm with a responsive dashboard layout (header, navigation sidebar, main content panel, and bottom playback bar). Interactive library browsing follows in Phase 26.
+Currently at **Phase 26 (Library browser)** in **Stage 4 (Terminal User Interface)** of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play` plays local FLAC files with extracted Vorbis comments and artwork metadata, backed by a persistent SQLite library (`rusqlite`) with directory scanning (`walkdir`), indexing, FTS5/indexed search, favorites, and batched playback history, while `termwave tui` initializes Ratatui + Crossterm with a responsive dashboard layout and an interactive library browser connected to SQLite queries for tracks, albums, artists, favorites, and recently played history. Now-playing details follow in Phase 27.
 
 ## Usage
 
@@ -28,7 +28,7 @@ termwave tui
 - `src/main.rs` — Thin binary entry point
 - `src/lib.rs` — Core library exports
 - `src/cli.rs` — Command-line interface boundary
-- `src/tui/` — Terminal user interface (`mod.rs` rendering loop, `terminal.rs` Ratatui/Crossterm lifecycle, `layout.rs` responsive dashboard)
+- `src/tui/` — Terminal user interface (`mod.rs` loop, `terminal.rs` lifecycle, `layout.rs` dashboard, `browser.rs` library browser)
 - `src/audio/` — Audio engine boundary (`PlaybackState`, `validation`, `decoder`, `output`, `queue`, `volume`, and `playback`)
 - `src/metadata/` — Metadata (`mod.rs`) and embedded artwork (`artwork.rs`) boundary
 - `src/library/` — Music library directory scanning (`scanner.rs`), SQLite database/migrations (`db.rs`), indexing (`indexer.rs`), search (`search.rs`), favorites (`favorites.rs`), and playback history (`history.rs`) boundary

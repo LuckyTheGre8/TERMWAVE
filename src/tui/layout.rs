@@ -1,10 +1,12 @@
 //! Responsive terminal dashboard layout and region rendering.
 
+use std::path::Path;
+
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use super::TuiState;
 
@@ -246,32 +248,332 @@ fn render_main_content(frame: &mut Frame, area: Rect, state: &TuiState) {
     let is_focused = state.focus == FocusRegion::MainContent;
     let border_style = region_border_style(is_focused);
 
-    let lines = vec![
-        Line::from(Span::styled(
-            state.active_section.label(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            state.active_section.description(),
-            Style::default().fg(Color::Gray),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Tab: switch focus  |  Up/Down: navigate  |  q / Esc / Ctrl+C: quit",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(main_panel_title(state));
 
-    let panel = Paragraph::new(lines).alignment(Alignment::Left).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style)
-            .title(state.active_section.label()),
-    );
-    frame.render_widget(panel, area);
+    match state.active_section {
+        NavSection::Library => {
+            if state.library.tracks.is_empty() {
+                render_empty_section(
+                    frame,
+                    area,
+                    block,
+                    "No tracks indexed in library yet.",
+                    "Scan a music directory into the library database to browse tracks.",
+                );
+                return;
+            }
+            let items: Vec<ListItem> = state
+                .library
+                .tracks
+                .iter()
+                .map(|track| {
+                    let title = track_display_title(track.title.as_deref(), &track.source_path);
+                    let artist = track.artist.as_deref().unwrap_or("Unknown Artist");
+                    let album = track.album.as_deref().unwrap_or("Unknown Album");
+                    let dur = format_duration_ms(track.duration_ms);
+                    ListItem::new(Line::from(vec![
+                        Span::styled(title, Style::default().fg(Color::White)),
+                        Span::styled(
+                            format!("  —  {artist}  [{album}]  ({dur})"),
+                            Style::default().fg(Color::Gray),
+                        ),
+                    ]))
+                })
+                .collect();
+            render_selectable_list(
+                frame,
+                area,
+                block,
+                items,
+                state.library.selected_index(NavSection::Library),
+                is_focused,
+            );
+        }
+        NavSection::Albums => {
+            if state.library.albums.is_empty() {
+                render_empty_section(
+                    frame,
+                    area,
+                    block,
+                    "No albums indexed in library yet.",
+                    "Albums appear automatically when tagged tracks are scanned.",
+                );
+                return;
+            }
+            let items: Vec<ListItem> = state
+                .library
+                .albums
+                .iter()
+                .map(|album| {
+                    let year = album
+                        .release_year
+                        .map_or_else(String::new, |y| format!(" ({y})"));
+                    let count = state.library.track_count_for_album(album.id);
+                    ListItem::new(Line::from(vec![
+                        Span::styled(album.name.clone(), Style::default().fg(Color::White)),
+                        Span::styled(
+                            format!("{year}  —  {count} track(s)"),
+                            Style::default().fg(Color::Gray),
+                        ),
+                    ]))
+                })
+                .collect();
+            render_selectable_list(
+                frame,
+                area,
+                block,
+                items,
+                state.library.selected_index(NavSection::Albums),
+                is_focused,
+            );
+        }
+        NavSection::Artists => {
+            if state.library.artists.is_empty() {
+                render_empty_section(
+                    frame,
+                    area,
+                    block,
+                    "No artists indexed in library yet.",
+                    "Artists appear automatically when tagged tracks are scanned.",
+                );
+                return;
+            }
+            let items: Vec<ListItem> = state
+                .library
+                .artists
+                .iter()
+                .map(|artist| {
+                    let count = state.library.track_count_for_artist(artist.id);
+                    ListItem::new(Line::from(vec![
+                        Span::styled(artist.name.clone(), Style::default().fg(Color::White)),
+                        Span::styled(
+                            format!("  —  {count} track(s)"),
+                            Style::default().fg(Color::Gray),
+                        ),
+                    ]))
+                })
+                .collect();
+            render_selectable_list(
+                frame,
+                area,
+                block,
+                items,
+                state.library.selected_index(NavSection::Artists),
+                is_focused,
+            );
+        }
+        NavSection::Favorites => {
+            if state.library.favorites.is_empty() {
+                render_empty_section(
+                    frame,
+                    area,
+                    block,
+                    "No favorite tracks yet.",
+                    "Mark tracks as favorites to access them quickly here.",
+                );
+                return;
+            }
+            let items: Vec<ListItem> = state
+                .library
+                .favorites
+                .iter()
+                .map(|fav| {
+                    let title =
+                        track_display_title(fav.track.title.as_deref(), &fav.track.source_path);
+                    let artist = fav.track.artist.as_deref().unwrap_or("Unknown Artist");
+                    let missing = if fav.file_exists { "" } else { " [missing]" };
+                    ListItem::new(Line::from(vec![
+                        Span::styled("* ", Style::default().fg(Color::Yellow)),
+                        Span::styled(title, Style::default().fg(Color::White)),
+                        Span::styled(
+                            format!("  —  {artist}{missing}"),
+                            Style::default().fg(Color::Gray),
+                        ),
+                    ]))
+                })
+                .collect();
+            render_selectable_list(
+                frame,
+                area,
+                block,
+                items,
+                state.library.selected_index(NavSection::Favorites),
+                is_focused,
+            );
+        }
+        NavSection::RecentlyPlayed => {
+            if state.library.recently_played.is_empty() {
+                render_empty_section(
+                    frame,
+                    area,
+                    block,
+                    "No recently played tracks.",
+                    "Playback history entries will appear here after listening.",
+                );
+                return;
+            }
+            let items: Vec<ListItem> = state
+                .library
+                .recently_played
+                .iter()
+                .map(|entry| {
+                    let title =
+                        track_display_title(entry.track.title.as_deref(), &entry.track.source_path);
+                    let artist = entry.track.artist.as_deref().unwrap_or("Unknown Artist");
+                    let dur = format_duration_ms(Some(entry.playback_duration_ms));
+                    ListItem::new(Line::from(vec![
+                        Span::styled(title, Style::default().fg(Color::White)),
+                        Span::styled(
+                            format!("  —  {artist}  (played {dur})"),
+                            Style::default().fg(Color::Gray),
+                        ),
+                    ]))
+                })
+                .collect();
+            render_selectable_list(
+                frame,
+                area,
+                block,
+                items,
+                state.library.selected_index(NavSection::RecentlyPlayed),
+                is_focused,
+            );
+        }
+        NavSection::Home => {
+            let lines = vec![
+                Line::from(Span::styled(
+                    "Library Overview",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(format!(
+                    "Tracks: {}  |  Albums: {}  |  Artists: {}  |  Favorites: {}",
+                    state.library.tracks.len(),
+                    state.library.albums.len(),
+                    state.library.artists.len(),
+                    state.library.favorites.len(),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Tab / Enter: focus list  |  Up/Down (j/k): navigate  |  q: quit",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            let panel = Paragraph::new(lines)
+                .alignment(Alignment::Left)
+                .block(block);
+            frame.render_widget(panel, area);
+        }
+        other => {
+            let lines = vec![
+                Line::from(Span::styled(
+                    other.label(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    other.description(),
+                    Style::default().fg(Color::Gray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Tab: switch focus  |  Up/Down: navigate  |  q / Esc / Ctrl+C: quit",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            let panel = Paragraph::new(lines)
+                .alignment(Alignment::Left)
+                .block(block);
+            frame.render_widget(panel, area);
+        }
+    }
+}
+
+fn main_panel_title(state: &TuiState) -> String {
+    let count = state.library.section_len(state.active_section);
+    if count > 0 {
+        let pos = state
+            .library
+            .selected_index(state.active_section)
+            .map_or(0, |i| i + 1);
+        format!("{} ({pos}/{count})", state.active_section.label())
+    } else {
+        state.active_section.label().to_string()
+    }
+}
+
+fn render_empty_section(
+    frame: &mut Frame,
+    area: Rect,
+    block: Block<'_>,
+    headline: &str,
+    hint: &str,
+) {
+    let lines = vec![
+        Line::from(Span::styled(headline, Style::default().fg(Color::White))),
+        Line::from(""),
+        Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+    ];
+    let paragraph = Paragraph::new(lines)
+        .alignment(Alignment::Left)
+        .block(block);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_selectable_list(
+    frame: &mut Frame,
+    area: Rect,
+    block: Block<'_>,
+    items: Vec<ListItem<'_>>,
+    selected: Option<usize>,
+    is_focused: bool,
+) {
+    let highlight_style = if is_focused {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    };
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_symbol("> ")
+        .highlight_style(highlight_style);
+
+    let mut list_state = ListState::default();
+    list_state.select(selected);
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn track_display_title(title: Option<&str>, source_path: &str) -> String {
+    if let Some(t) = title.map(str::trim).filter(|s| !s.is_empty()) {
+        return t.to_string();
+    }
+    Path::new(source_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| source_path.to_string())
+}
+
+fn format_duration_ms(duration_ms: Option<u64>) -> String {
+    let Some(ms) = duration_ms else {
+        return "--:--".to_string();
+    };
+    let total_secs = ms / 1000;
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    format!("{mins:02}:{secs:02}")
 }
 
 fn render_playback_bar(frame: &mut Frame, area: Rect, state: &TuiState) {

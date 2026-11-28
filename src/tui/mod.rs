@@ -4,6 +4,7 @@
 //! the event-driven rendering loop while keeping audio decoding and playback
 //! decoupled.
 
+pub mod browser;
 pub mod layout;
 pub mod terminal;
 
@@ -17,6 +18,9 @@ use ratatui::Frame;
 use ratatui::backend::Backend;
 use thiserror::Error;
 
+use crate::library::{LibraryDatabase, LibraryError};
+
+pub use browser::{LibraryBrowser, ListCursor};
 pub use layout::{DashboardLayout, FocusRegion, NavSection, render_dashboard};
 pub use terminal::{TuiTerminal, install_panic_restore_hook, restore_terminal_state};
 
@@ -62,10 +66,19 @@ pub struct TuiState {
     pub active_section: NavSection,
     /// Currently focused dashboard region.
     pub focus: FocusRegion,
+    /// Interactive music library browser state.
+    pub library: LibraryBrowser,
 }
 
 impl Default for TuiState {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TuiState {
+    /// Creates a new [`TuiState`] with `needs_redraw` enabled.
+    pub fn new() -> Self {
         Self {
             should_quit: false,
             needs_redraw: true,
@@ -73,11 +86,25 @@ impl Default for TuiState {
             rendered_frames: 0,
             active_section: NavSection::default(),
             focus: FocusRegion::default(),
+            library: LibraryBrowser::default(),
         }
     }
-}
 
-impl TuiState {
+    /// Creates a [`TuiState`] preloaded with tracks, albums, artists, favorites,
+    /// and recent history from `db`.
+    pub fn from_database(db: &LibraryDatabase) -> Result<Self, LibraryError> {
+        let mut state = Self::new();
+        state.refresh_library(db)?;
+        Ok(state)
+    }
+
+    /// Reloads library browser data from `db` and marks the UI for redraw.
+    pub fn refresh_library(&mut self, db: &LibraryDatabase) -> Result<(), LibraryError> {
+        self.library.load_from_database(db)?;
+        self.needs_redraw = true;
+        Ok(())
+    }
+
     /// Processes a single [`TuiInputEvent`] and updates dirty/quit state.
     pub fn handle_event(&mut self, event: TuiInputEvent) {
         match event {
@@ -85,13 +112,21 @@ impl TuiState {
                 if key.kind != KeyEventKind::Press {
                     return;
                 }
-                let is_quit_key = matches!(
-                    key.code,
-                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc
-                ) || (key.code == KeyCode::Char('c')
-                    && key.modifiers.contains(KeyModifiers::CONTROL));
-                if is_quit_key {
+                if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+                    || (key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL))
+                {
                     self.should_quit = true;
+                    return;
+                }
+
+                if key.code == KeyCode::Esc {
+                    if self.focus != FocusRegion::Sidebar {
+                        self.focus = FocusRegion::Sidebar;
+                        self.needs_redraw = true;
+                    } else {
+                        self.should_quit = true;
+                    }
                     return;
                 }
 
@@ -100,12 +135,52 @@ impl TuiState {
                         self.focus = self.focus.next();
                         self.needs_redraw = true;
                     }
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l')
+                        if self.focus == FocusRegion::Sidebar =>
+                    {
+                        self.focus = FocusRegion::MainContent;
+                        self.needs_redraw = true;
+                    }
+                    KeyCode::Left | KeyCode::Char('h')
+                        if self.focus == FocusRegion::MainContent =>
+                    {
+                        self.focus = FocusRegion::Sidebar;
+                        self.needs_redraw = true;
+                    }
                     KeyCode::Up | KeyCode::Char('k') if self.focus == FocusRegion::Sidebar => {
                         self.active_section = self.active_section.previous();
                         self.needs_redraw = true;
                     }
                     KeyCode::Down | KeyCode::Char('j') if self.focus == FocusRegion::Sidebar => {
                         self.active_section = self.active_section.next();
+                        self.needs_redraw = true;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if self.focus == FocusRegion::MainContent => {
+                        self.library.select_previous(self.active_section);
+                        self.needs_redraw = true;
+                    }
+                    KeyCode::Down | KeyCode::Char('j')
+                        if self.focus == FocusRegion::MainContent =>
+                    {
+                        self.library.select_next(self.active_section);
+                        self.needs_redraw = true;
+                    }
+                    KeyCode::PageUp if self.focus == FocusRegion::MainContent => {
+                        self.library.page_up(self.active_section, 10);
+                        self.needs_redraw = true;
+                    }
+                    KeyCode::PageDown if self.focus == FocusRegion::MainContent => {
+                        self.library.page_down(self.active_section, 10);
+                        self.needs_redraw = true;
+                    }
+                    KeyCode::Home | KeyCode::Char('g')
+                        if self.focus == FocusRegion::MainContent =>
+                    {
+                        self.library.select_first(self.active_section);
+                        self.needs_redraw = true;
+                    }
+                    KeyCode::End | KeyCode::Char('G') if self.focus == FocusRegion::MainContent => {
+                        self.library.select_last(self.active_section);
                         self.needs_redraw = true;
                     }
                     _ => {}
@@ -144,7 +219,7 @@ pub fn run_tui_loop<B: Backend>(
     shutdown: Arc<AtomicBool>,
     tick_rate: Duration,
 ) -> Result<TuiState, TuiError> {
-    let mut state = TuiState::default();
+    let mut state = TuiState::new();
     if let Ok(area) = terminal.inner().size() {
         state.terminal_size = (area.width, area.height);
     }
@@ -274,6 +349,71 @@ mod tests {
             KeyModifiers::NONE,
         )));
         assert_eq!(state.focus, FocusRegion::MainContent);
+    }
+
+    #[test]
+    fn renders_database_library_views_and_supports_keyboard_navigation() {
+        use crate::library::{LibraryDatabase, NewTrackRecord};
+
+        let db = LibraryDatabase::open_in_memory().unwrap();
+        let artist = db.upsert_artist("Miles Davis").unwrap();
+        let album = db
+            .upsert_album("Kind of Blue", Some(artist.id), Some(1959), None)
+            .unwrap();
+        db.upsert_track(&NewTrackRecord {
+            source_path: "/music/so_what.flac".to_string(),
+            title: Some("So What".to_string()),
+            artist: Some("Miles Davis".to_string()),
+            album: Some("Kind of Blue".to_string()),
+            album_artist: None,
+            artist_id: Some(artist.id),
+            album_id: Some(album.id),
+            genre: Some("Jazz".to_string()),
+            duration_ms: Some(562_000),
+            codec: "FLAC".to_string(),
+            sample_rate: Some(96_000),
+            bit_depth: Some(24),
+            channels: Some(2),
+            file_size: 100_000,
+            track_number: Some(1),
+            disc_number: Some(1),
+            last_modified: Some(100),
+        })
+        .unwrap();
+
+        let mut state = TuiState::from_database(&db).unwrap();
+        state.terminal_size = (100, 30);
+
+        // Library tracks render
+        let library_render = render_to_string(100, 30, &state);
+        assert!(library_render.contains("So What"));
+        assert!(library_render.contains("Miles Davis"));
+        assert!(library_render.contains("09:22"));
+
+        // Enter focuses MainContent; Esc returns focus to Sidebar
+        state.handle_event(TuiInputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(state.focus, FocusRegion::MainContent);
+        state.handle_event(TuiInputEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(state.focus, FocusRegion::Sidebar);
+        assert!(!state.should_quit);
+
+        // Switch to Albums and render
+        state.active_section = NavSection::Albums;
+        let albums_render = render_to_string(100, 30, &state);
+        assert!(albums_render.contains("Kind of Blue"));
+        assert!(albums_render.contains("1959"));
+
+        // Switch to Artists and render
+        state.active_section = NavSection::Artists;
+        let artists_render = render_to_string(100, 30, &state);
+        assert!(artists_render.contains("Miles Davis"));
+        assert!(artists_render.contains("1 track(s)"));
     }
 
     #[test]
