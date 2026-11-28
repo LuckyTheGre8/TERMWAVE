@@ -7,6 +7,7 @@
 pub mod db;
 pub mod indexer;
 pub mod scanner;
+pub mod search;
 
 use std::path::PathBuf;
 
@@ -20,6 +21,7 @@ pub use scanner::{
     BackgroundScanHandle, ScanOptions, ScanProgress, ScanSummary, ScanWarning, ScannedAudioFormat,
     ScannedTrack, scan_directories, scan_directory, spawn_directory_scan,
 };
+pub use search::{DEFAULT_SEARCH_LIMIT, SearchOptions, SearchResults};
 
 /// Errors produced by music library scanning, indexing, or queries.
 #[derive(Debug, Error)]

@@ -66,7 +66,7 @@ src/
 - Resilient tag parsing: handles missing metadata and malformed tag/date strings gracefully via `extract_metadata_or_default` so playback never fails due to tagging errors.
 - Integrates with `PlaybackTrackInfo` and `PreloadedTrack` so metadata and lightweight `ArtworkSummary` extraction happen ahead of time during background preloading.
 
-### `library` (`src/library/mod.rs`, `src/library/scanner.rs`, `src/library/db.rs`, `src/library/indexer.rs`)
+### `library` (`src/library/mod.rs`, `src/library/scanner.rs`, `src/library/db.rs`, `src/library/indexer.rs`, `src/library/search.rs`)
 - Owns recursive directory scanning (`walkdir`), SQLite persistence (`rusqlite` bundled), indexing, search, favorites, and playback history.
 - Directory scanning (`scanner.rs`):
   - Recursively scans one or more root directories via `scan_directory` / `scan_directories`, identifying supported formats (`FLAC`), ignoring irrelevant/hidden/empty files, and optionally verifying leading container magic bytes.
@@ -74,11 +74,13 @@ src/
   - Supports non-blocking background traversal via `spawn_directory_scan` (`BackgroundScanHandle`) with live atomic `ScanProgress` counters and cooperative cancellation so scanning never blocks the playback engine.
 - SQLite persistence (`db.rs`):
   - `LibraryDatabase` manages persistent (`open`) and ephemeral (`open_in_memory`) SQLite connections with WAL mode, busy timeout, and `PRAGMA foreign_keys = ON`.
-  - Versioned transactional migrations (`schema_migrations`) establish `artists`, `albums`, and `tracks` tables with appropriate indexes and uniqueness constraints.
+  - Versioned transactional migrations (`schema_migrations`) establish `artists`, `albums`, and `tracks` tables alongside `COLLATE NOCASE` indexes and an FTS5 `tracks_fts` virtual table kept synchronized via triggers.
   - Exposes typed CRUD/upsert operations (`upsert_artist`, `upsert_album`, `upsert_track`, `get_*`, `list_*`, `delete_track_by_path`, `with_transaction`) to prevent duplicate entries.
 - Library indexing (`indexer.rs`):
   - `index_directory`, `rescan_library`, and `index_scan_summary` atomically index discovered tracks inside SQLite transactions.
   - Normalizes paths and deduplicates scan batches, skips unchanged files (`file_size` + `last_modified`), re-extracts metadata for modified files, reconciles moved/renamed files in-place (preserving track IDs and `date_added`), prunes deleted tracks under scanned roots, and cleans up orphaned albums/artists.
+- Music search (`search.rs`):
+  - `search_tracks`, `search_artists`, `search_albums`, and `search_library` support partial matching, multi-word FTS5 prefix queries, safe `LIKE` wildcard escaping, relevance-first ordering, and pagination (`SearchOptions`).
 - Basic single-file playback must work independently without requiring the library database.
 
 ### `config` (`src/config.rs`)

@@ -16,10 +16,11 @@ struct Migration {
 }
 
 /// Ordered list of schema migrations applied to the library database.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "create_core_library_tables",
-    sql: "
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "create_core_library_tables",
+        sql: "
         CREATE TABLE IF NOT EXISTS artists (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE
@@ -63,7 +64,50 @@ const MIGRATIONS: &[Migration] = &[Migration {
         CREATE INDEX IF NOT EXISTS idx_tracks_album ON tracks(album);
         CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id);
     ",
-}];
+    },
+    Migration {
+        version: 2,
+        name: "add_library_search_indexes_and_fts",
+        sql: "
+        CREATE INDEX IF NOT EXISTS idx_artists_name_nocase ON artists(name COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_albums_name_nocase ON albums(name COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_tracks_title_nocase ON tracks(title COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_tracks_artist_nocase ON tracks(artist COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_tracks_album_nocase ON tracks(album COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_tracks_genre_nocase ON tracks(genre COLLATE NOCASE);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
+            title,
+            artist,
+            album,
+            album_artist,
+            genre,
+            content='tracks',
+            content_rowid='id',
+            tokenize='unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS tracks_fts_ai AFTER INSERT ON tracks BEGIN
+            INSERT INTO tracks_fts(rowid, title, artist, album, album_artist, genre)
+            VALUES (new.id, new.title, new.artist, new.album, new.album_artist, new.genre);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS tracks_fts_ad AFTER DELETE ON tracks BEGIN
+            INSERT INTO tracks_fts(tracks_fts, rowid, title, artist, album, album_artist, genre)
+            VALUES ('delete', old.id, old.title, old.artist, old.album, old.album_artist, old.genre);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS tracks_fts_au AFTER UPDATE ON tracks BEGIN
+            INSERT INTO tracks_fts(tracks_fts, rowid, title, artist, album, album_artist, genre)
+            VALUES ('delete', old.id, old.title, old.artist, old.album, old.album_artist, old.genre);
+            INSERT INTO tracks_fts(rowid, title, artist, album, album_artist, genre)
+            VALUES (new.id, new.title, new.artist, new.album, new.album_artist, new.genre);
+        END;
+
+        INSERT INTO tracks_fts(tracks_fts) VALUES('rebuild');
+    ",
+    },
+];
 
 /// Stored artist row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,6 +448,10 @@ impl LibraryDatabase {
             .query_row("SELECT COUNT(*) FROM artists", [], |row| row.get(0))?;
         Ok(count.max(0) as usize)
     }
+
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
 }
 
 pub(crate) fn upsert_artist_conn(
@@ -626,7 +674,7 @@ pub(crate) fn prune_orphaned_albums_and_artists_conn(
     Ok((pruned_albums, pruned_artists))
 }
 
-fn row_to_track_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRecord> {
+pub(crate) fn row_to_track_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRecord> {
     let duration_ms: Option<i64> = row.get(9)?;
     let file_size: i64 = row.get(14)?;
     Ok(TrackRecord {
@@ -666,11 +714,11 @@ mod tests {
     #[test]
     fn opens_in_memory_and_runs_idempotent_migrations() {
         let mut db = LibraryDatabase::open_in_memory().expect("open in-memory db");
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), 2);
 
         // Re-running migrations should be a safe no-op
         db.run_migrations().expect("idempotent migrations");
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), 2);
     }
 
     #[test]
@@ -681,7 +729,7 @@ mod tests {
 
         {
             let db = LibraryDatabase::open(&db_path).expect("create persistent db");
-            assert_eq!(db.schema_version().unwrap(), 1);
+            assert_eq!(db.schema_version().unwrap(), 2);
             let artist = db.upsert_artist("Miles Davis").unwrap();
             let album = db
                 .upsert_album("Kind of Blue", Some(artist.id), Some(1959), Some("cover_1"))
