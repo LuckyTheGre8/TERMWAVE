@@ -12,11 +12,12 @@ pub mod library;
 pub mod metadata;
 
 pub use library::{
-    AlbumRecord, ArtistRecord, BackgroundScanHandle, DEFAULT_SEARCH_LIMIT, FavoriteTrack,
-    IndexOptions, IndexSummary, LibraryDatabase, LibraryError, NewTrackRecord, ScanOptions,
-    ScanProgress, ScanSummary, ScanWarning, ScannedAudioFormat, ScannedTrack, SearchOptions,
-    SearchResults, TrackRecord, index_directory, index_scan_summary, rescan_library,
-    scan_directories, scan_directory, spawn_directory_scan,
+    AlbumRecord, ArtistRecord, BackgroundScanHandle, DEFAULT_HISTORY_BATCH_SIZE,
+    DEFAULT_MIN_HISTORY_DURATION, DEFAULT_SEARCH_LIMIT, FavoriteTrack, HistoryPolicy,
+    HistoryRecorder, IndexOptions, IndexSummary, LibraryDatabase, LibraryError, NewTrackRecord,
+    PendingHistoryEntry, PlaybackHistoryEntry, ScanOptions, ScanProgress, ScanSummary, ScanWarning,
+    ScannedAudioFormat, ScannedTrack, SearchOptions, SearchResults, TrackRecord, index_directory,
+    index_scan_summary, rescan_library, scan_directories, scan_directory, spawn_directory_scan,
 };
 pub use metadata::{
     ArtworkDimensions, ArtworkExtractOptions, ArtworkFormat, ArtworkRole, ArtworkSummary,

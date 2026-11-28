@@ -66,7 +66,7 @@ src/
 - Resilient tag parsing: handles missing metadata and malformed tag/date strings gracefully via `extract_metadata_or_default` so playback never fails due to tagging errors.
 - Integrates with `PlaybackTrackInfo` and `PreloadedTrack` so metadata and lightweight `ArtworkSummary` extraction happen ahead of time during background preloading.
 
-### `library` (`src/library/mod.rs`, `src/library/scanner.rs`, `src/library/db.rs`, `src/library/indexer.rs`, `src/library/search.rs`, `src/library/favorites.rs`)
+### `library` (`src/library/mod.rs`, `src/library/scanner.rs`, `src/library/db.rs`, `src/library/indexer.rs`, `src/library/search.rs`, `src/library/favorites.rs`, `src/library/history.rs`)
 - Owns recursive directory scanning (`walkdir`), SQLite persistence (`rusqlite` bundled), indexing, search, favorites, and playback history.
 - Directory scanning (`scanner.rs`):
   - Recursively scans one or more root directories via `scan_directory` / `scan_directories`, identifying supported formats (`FLAC`), ignoring irrelevant/hidden/empty files, and optionally verifying leading container magic bytes.
@@ -74,7 +74,7 @@ src/
   - Supports non-blocking background traversal via `spawn_directory_scan` (`BackgroundScanHandle`) with live atomic `ScanProgress` counters and cooperative cancellation so scanning never blocks the playback engine.
 - SQLite persistence (`db.rs`):
   - `LibraryDatabase` manages persistent (`open`) and ephemeral (`open_in_memory`) SQLite connections with WAL mode, busy timeout, and `PRAGMA foreign_keys = ON`.
-  - Versioned transactional migrations (`schema_migrations`) establish `artists`, `albums`, `tracks`, and `favorites` tables alongside `COLLATE NOCASE` indexes and an FTS5 `tracks_fts` virtual table kept synchronized via triggers.
+  - Versioned transactional migrations (`schema_migrations`) establish `artists`, `albums`, `tracks`, `favorites`, and `playback_history` tables alongside `COLLATE NOCASE` indexes and an FTS5 `tracks_fts` virtual table kept synchronized via triggers.
   - Exposes typed CRUD/upsert operations (`upsert_artist`, `upsert_album`, `upsert_track`, `get_*`, `list_*`, `delete_track_by_path`, `with_transaction`) to prevent duplicate entries.
 - Library indexing (`indexer.rs`):
   - `index_directory`, `rescan_library`, and `index_scan_summary` atomically index discovered tracks inside SQLite transactions.
@@ -83,6 +83,9 @@ src/
   - `search_tracks`, `search_artists`, `search_albums`, and `search_library` support partial matching, multi-word FTS5 prefix queries, safe `LIKE` wildcard escaping, relevance-first ordering, and pagination (`SearchOptions`).
 - Favorites (`favorites.rs`):
   - `add_favorite`, `remove_favorite`, `toggle_favorite`, `is_favorite`, `list_favorites`, `list_available_favorites`, and `prune_missing_favorites` persist favorite status in SQLite (`ON DELETE CASCADE`) and annotate/filter/prune entries whose backing files are missing on disk.
+- Playback history (`history.rs`):
+  - `record_playback`, `record_playback_batch`, `recently_played`, and `recently_played_unique_tracks` track played tracks, timestamps, and playback durations.
+  - `HistoryRecorder` (`HistoryPolicy`) avoids excessive SQLite writes by filtering brief skips below `min_duration` and buffering entries for single-transaction batch flushes.
 - Basic single-file playback must work independently without requiring the library database.
 
 ### `config` (`src/config.rs`)

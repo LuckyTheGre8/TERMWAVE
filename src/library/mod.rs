@@ -6,6 +6,7 @@
 
 pub mod db;
 pub mod favorites;
+pub mod history;
 pub mod indexer;
 pub mod scanner;
 pub mod search;
@@ -16,6 +17,10 @@ use thiserror::Error;
 
 pub use db::{AlbumRecord, ArtistRecord, LibraryDatabase, NewTrackRecord, TrackRecord};
 pub use favorites::FavoriteTrack;
+pub use history::{
+    DEFAULT_HISTORY_BATCH_SIZE, DEFAULT_MIN_HISTORY_DURATION, HistoryPolicy, HistoryRecorder,
+    PendingHistoryEntry, PlaybackHistoryEntry,
+};
 pub use indexer::{
     IndexOptions, IndexSummary, index_directory, index_scan_summary, rescan_library,
 };

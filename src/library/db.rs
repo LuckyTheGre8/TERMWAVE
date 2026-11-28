@@ -119,6 +119,23 @@ const MIGRATIONS: &[Migration] = &[
         CREATE INDEX IF NOT EXISTS idx_favorites_date_added ON favorites(date_added DESC);
     ",
     },
+    Migration {
+        version: 4,
+        name: "create_playback_history_table",
+        sql: "
+        CREATE TABLE IF NOT EXISTS playback_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+            played_at INTEGER NOT NULL,
+            playback_duration_ms INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_playback_history_played_at
+            ON playback_history(played_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_playback_history_track_id
+            ON playback_history(track_id);
+    ",
+    },
 ];
 
 /// Stored artist row.
@@ -726,11 +743,11 @@ mod tests {
     #[test]
     fn opens_in_memory_and_runs_idempotent_migrations() {
         let mut db = LibraryDatabase::open_in_memory().expect("open in-memory db");
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), 4);
 
         // Re-running migrations should be a safe no-op
         db.run_migrations().expect("idempotent migrations");
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -741,7 +758,7 @@ mod tests {
 
         {
             let db = LibraryDatabase::open(&db_path).expect("create persistent db");
-            assert_eq!(db.schema_version().unwrap(), 3);
+            assert_eq!(db.schema_version().unwrap(), 4);
             let artist = db.upsert_artist("Miles Davis").unwrap();
             let album = db
                 .upsert_album("Kind of Blue", Some(artist.id), Some(1959), Some("cover_1"))
