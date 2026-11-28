@@ -10,6 +10,7 @@ use crate::audio::AudioError;
 use crate::config::ConfigError;
 use crate::library::LibraryError;
 use crate::metadata::MetadataError;
+use crate::tui::TuiError;
 
 /// Crate-wide `Result` alias using [`TermwaveError`].
 pub type Result<T> = std::result::Result<T, TermwaveError>;
@@ -33,6 +34,10 @@ pub enum TermwaveError {
     /// Failure originating in configuration loading or validation.
     #[error("configuration error: {0}")]
     Config(#[from] ConfigError),
+
+    /// Failure originating in the terminal user interface.
+    #[error("terminal UI error: {0}")]
+    Tui(#[from] TuiError),
 
     /// Uncategorized I/O failure.
     #[error("I/O error: {0}")]

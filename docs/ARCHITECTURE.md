@@ -17,8 +17,9 @@ src/
 │   ├── queue.rs       # Ordered track queue, history stacks, and boundary guards
 │   ├── volume.rs      # Volume normalization, range validation, mute, and clipping guard
 │   └── playback.rs    # Bounded-channel decoder worker and rodio playback pipeline
-├── metadata.rs        # Tag and embedded artwork extraction boundary
-├── library.rs         # Music library scanning, search, and SQLite boundary
+├── metadata/          # Tag and embedded artwork extraction boundary
+├── library/           # Music library scanning, search, and SQLite boundary
+├── tui/               # Ratatui + Crossterm terminal user interface
 ├── config.rs          # User preferences and platform-aware defaults
 └── error.rs           # Unified TermwaveError and crate Result<T> alias
 ```
@@ -26,10 +27,14 @@ src/
 ## Module Responsibilities and Boundaries
 
 ### `cli` (`src/cli.rs`)
-- Parses command-line arguments and subcommands using `clap` (`play <file>` plus planned `info`, `scan`, `tui`, and `devices` subcommands).
-- Handles command-line entry, `--help` / `--version`, and delegates work to lower-level subsystems.
+- Parses command-line arguments and subcommands using `clap` (`play <file>`, `tui`, plus planned `info`, `scan`, and `devices` subcommands).
+- Handles command-line entry, `--help` / `--version`, and delegates work to lower-level subsystems (`audio`, `tui`).
 - Must not own decoding, audio device management, or database logic.
-- Planned companion UI layer (`tui` in later phases) will follow the same rule: presentation reads state and dispatches commands without blocking playback.
+
+### `tui` (`src/tui/mod.rs`, `src/tui/terminal.rs`)
+- Integrates `ratatui` and `crossterm` for the interactive terminal user interface (`termwave tui`).
+- Terminal lifecycle (`terminal.rs`): `TuiTerminal::enter()` enables raw mode, enters the alternate screen, hides the cursor, and installs a chained panic-restoration hook (`install_panic_restore_hook`). `TuiTerminal::restore()` and `Drop` guarantee idempotent restoration on exit, error, or panic.
+- Rendering loop (`mod.rs`): Event-driven `run_tui_loop` polls Crossterm events at `DEFAULT_TICK_RATE`, tracks dirty state (`needs_redraw`) to avoid excessive redraws, handles terminal resize events, and exits cleanly on `'q'`, `Esc`, `Ctrl+C`, or external shutdown signals.
 
 ### `audio` (`src/audio/`)
 - Owns local file validation (`validation.rs`), source-agnostic FLAC decoding (`decoder.rs` powered by Symphonia), system audio output initialization (`output.rs` encapsulating `rodio`/`cpal`), bounded-channel playback execution and control (`playback.rs` with `PlaybackController`), and the validated `PlaybackState` lifecycle (`mod.rs`).

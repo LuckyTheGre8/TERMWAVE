@@ -10,6 +10,7 @@ pub mod config;
 pub mod error;
 pub mod library;
 pub mod metadata;
+pub mod tui;
 
 pub use library::{
     AlbumRecord, ArtistRecord, BackgroundScanHandle, DEFAULT_HISTORY_BATCH_SIZE,
@@ -24,3 +25,4 @@ pub use metadata::{
     EmbeddedArtwork, MetadataError, TerminalArtwork, TerminalArtworkLayout, TrackMetadata,
     extract_artwork, extract_artwork_or_none, extract_metadata, extract_metadata_or_default,
 };
+pub use tui::{DEFAULT_TICK_RATE, TuiError, TuiInputEvent, TuiState, TuiTerminal, run_tui};

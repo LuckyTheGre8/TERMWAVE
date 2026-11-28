@@ -42,7 +42,7 @@ pub enum Commands {
     /// (planned) Scan a directory into the local music library.
     Scan(ScanArgs),
 
-    /// (planned) Launch the interactive terminal user interface.
+    /// Launch the interactive terminal user interface.
     Tui,
 
     /// (planned) List available audio output devices.
@@ -353,7 +353,8 @@ pub fn execute_with_shutdown(cli: Cli, shutdown: Arc<AtomicBool>) -> anyhow::Res
             anyhow::bail!("the 'scan' subcommand is planned for a future phase")
         }
         Some(Commands::Tui) => {
-            anyhow::bail!("the 'tui' subcommand is planned for a future phase")
+            crate::tui::run_tui(shutdown)?;
+            Ok(())
         }
         Some(Commands::Devices) => {
             anyhow::bail!("the 'devices' subcommand is planned for a future phase")
