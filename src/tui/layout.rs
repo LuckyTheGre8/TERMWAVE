@@ -6,9 +6,10 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
 use super::TuiState;
+use super::keymap::DOCUMENTED_SHORTCUTS;
 
 /// Primary navigation sections displayed in the sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -179,6 +180,10 @@ pub fn render_dashboard(frame: &mut Frame, state: &TuiState) {
     }
     render_main_content(frame, layout.main_content, state);
     render_playback_bar(frame, layout.playback_bar, state);
+
+    if state.show_help {
+        render_help_overlay(frame, area);
+    }
 }
 
 fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
@@ -644,10 +649,11 @@ fn render_playback_bar(frame: &mut Frame, area: Rect, state: &TuiState) {
             Style::default().fg(Color::Red),
         ))
     } else {
+        let shuffle_label = if state.shuffle_enabled { "On" } else { "Off" };
         Line::from(Span::styled(
             format!(
-                "{}  |  {}  |  {}",
-                np.position_label, np.volume_label, np.audio_info
+                "{}  |  {}  |  Shuffle: {shuffle_label}  |  Repeat: {}  |  {}",
+                np.position_label, np.volume_label, state.repeat_mode, np.audio_info
             ),
             Style::default().fg(Color::DarkGray),
         ))
@@ -670,4 +676,50 @@ fn region_border_style(focused: bool) -> Style {
     } else {
         Style::default().fg(Color::DarkGray)
     }
+}
+
+fn render_help_overlay(frame: &mut Frame, area: Rect) {
+    let width = area.width.saturating_sub(6).min(68).max(20.min(area.width));
+    let height = area
+        .height
+        .saturating_sub(4)
+        .min((DOCUMENTED_SHORTCUTS.len() as u16) + 5)
+        .max(5.min(area.height));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, popup);
+
+    let mut lines: Vec<Line> = DOCUMENTED_SHORTCUTS
+        .iter()
+        .map(|s| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{:<18}", s.key),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:<15}", format!("[{}]", s.scope)),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(s.description, Style::default().fg(Color::White)),
+            ])
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press ?, Esc, or q to close help",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let help = Paragraph::new(lines).alignment(Alignment::Left).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title("Keyboard Shortcuts"),
+    );
+    frame.render_widget(help, popup);
 }

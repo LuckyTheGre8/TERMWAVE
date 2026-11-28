@@ -5,6 +5,7 @@
 //! decoupled.
 
 pub mod browser;
+pub mod keymap;
 pub mod layout;
 pub mod now_playing;
 pub mod terminal;
@@ -14,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyEvent};
 use ratatui::Frame;
 use ratatui::backend::Backend;
 use thiserror::Error;
@@ -23,6 +24,10 @@ use crate::audio::{PlaybackController, PlaybackSnapshot};
 use crate::library::{LibraryDatabase, LibraryError};
 
 pub use browser::{LibraryBrowser, ListCursor};
+pub use keymap::{
+    DOCUMENTED_SHORTCUTS, RepeatMode, ShortcutDoc, TuiAction, dispatch_playback_action,
+    resolve_key_action,
+};
 pub use layout::{DashboardLayout, FocusRegion, NavSection, render_dashboard};
 pub use now_playing::NowPlayingInfo;
 pub use terminal::{TuiTerminal, install_panic_restore_hook, restore_terminal_state};
@@ -73,6 +78,14 @@ pub struct TuiState {
     pub library: LibraryBrowser,
     /// Latest centralized playback snapshot synchronized from `PlaybackController`.
     pub playback: PlaybackSnapshot,
+    /// Whether the `?` keyboard shortcuts help overlay is visible.
+    pub show_help: bool,
+    /// Whether queue shuffle is enabled.
+    pub shuffle_enabled: bool,
+    /// Active repeat mode (`Off`, `All`, `One`).
+    pub repeat_mode: RepeatMode,
+    /// Whether a text input widget (e.g. search box) currently captures character keys.
+    pub text_input_active: bool,
 }
 
 impl Default for TuiState {
@@ -93,6 +106,10 @@ impl TuiState {
             focus: FocusRegion::default(),
             library: LibraryBrowser::default(),
             playback: PlaybackController::new().snapshot(),
+            show_help: false,
+            shuffle_enabled: false,
+            repeat_mode: RepeatMode::default(),
+            text_input_active: false,
         }
     }
 
@@ -131,94 +148,109 @@ impl TuiState {
         NowPlayingInfo::from_snapshot(&self.playback)
     }
 
-    /// Processes a single [`TuiInputEvent`] and updates dirty/quit state.
-    pub fn handle_event(&mut self, event: TuiInputEvent) {
+    /// Processes a single [`TuiInputEvent`], updates UI state, and returns the
+    /// resolved [`TuiAction`] for optional controller dispatch.
+    pub fn handle_event(&mut self, event: TuiInputEvent) -> TuiAction {
         match event {
             TuiInputEvent::Key(key) => {
-                if key.kind != KeyEventKind::Press {
-                    return;
-                }
-                if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
-                    || (key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL))
-                {
-                    self.should_quit = true;
-                    return;
-                }
-
-                if key.code == KeyCode::Esc {
-                    if self.focus != FocusRegion::Sidebar {
-                        self.focus = FocusRegion::Sidebar;
-                        self.needs_redraw = true;
-                    } else {
-                        self.should_quit = true;
-                    }
-                    return;
-                }
-
-                match key.code {
-                    KeyCode::Tab => {
-                        self.focus = self.focus.next();
-                        self.needs_redraw = true;
-                    }
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l')
-                        if self.focus == FocusRegion::Sidebar =>
-                    {
-                        self.focus = FocusRegion::MainContent;
-                        self.needs_redraw = true;
-                    }
-                    KeyCode::Left | KeyCode::Char('h')
-                        if self.focus == FocusRegion::MainContent =>
-                    {
-                        self.focus = FocusRegion::Sidebar;
-                        self.needs_redraw = true;
-                    }
-                    KeyCode::Up | KeyCode::Char('k') if self.focus == FocusRegion::Sidebar => {
-                        self.active_section = self.active_section.previous();
-                        self.needs_redraw = true;
-                    }
-                    KeyCode::Down | KeyCode::Char('j') if self.focus == FocusRegion::Sidebar => {
-                        self.active_section = self.active_section.next();
-                        self.needs_redraw = true;
-                    }
-                    KeyCode::Up | KeyCode::Char('k') if self.focus == FocusRegion::MainContent => {
-                        self.library.select_previous(self.active_section);
-                        self.needs_redraw = true;
-                    }
-                    KeyCode::Down | KeyCode::Char('j')
-                        if self.focus == FocusRegion::MainContent =>
-                    {
-                        self.library.select_next(self.active_section);
-                        self.needs_redraw = true;
-                    }
-                    KeyCode::PageUp if self.focus == FocusRegion::MainContent => {
-                        self.library.page_up(self.active_section, 10);
-                        self.needs_redraw = true;
-                    }
-                    KeyCode::PageDown if self.focus == FocusRegion::MainContent => {
-                        self.library.page_down(self.active_section, 10);
-                        self.needs_redraw = true;
-                    }
-                    KeyCode::Home | KeyCode::Char('g')
-                        if self.focus == FocusRegion::MainContent =>
-                    {
-                        self.library.select_first(self.active_section);
-                        self.needs_redraw = true;
-                    }
-                    KeyCode::End | KeyCode::Char('G') if self.focus == FocusRegion::MainContent => {
-                        self.library.select_last(self.active_section);
-                        self.needs_redraw = true;
-                    }
-                    _ => {}
-                }
+                let action =
+                    resolve_key_action(key, self.focus, self.show_help, self.text_input_active);
+                self.apply_action(action);
+                action
             }
             TuiInputEvent::Resize(cols, rows) => {
                 self.terminal_size = (cols, rows);
                 self.needs_redraw = true;
+                TuiAction::Noop
             }
-            TuiInputEvent::Tick => {
-                // Only redraw on tick when active playback/progress updates require it.
+            TuiInputEvent::Tick => TuiAction::Noop,
+        }
+    }
+
+    fn apply_action(&mut self, action: TuiAction) {
+        match action {
+            TuiAction::Quit => self.should_quit = true,
+            TuiAction::ToggleHelp => {
+                self.show_help = !self.show_help;
+                self.needs_redraw = true;
             }
+            TuiAction::CloseHelp => {
+                self.show_help = false;
+                self.needs_redraw = true;
+            }
+            TuiAction::CycleFocus => {
+                self.focus = self.focus.next();
+                self.needs_redraw = true;
+            }
+            TuiAction::FocusSidebar => {
+                self.focus = FocusRegion::Sidebar;
+                self.needs_redraw = true;
+            }
+            TuiAction::FocusMainContent => {
+                self.focus = FocusRegion::MainContent;
+                self.needs_redraw = true;
+            }
+            TuiAction::SidebarUp => {
+                self.active_section = self.active_section.previous();
+                self.needs_redraw = true;
+            }
+            TuiAction::SidebarDown => {
+                self.active_section = self.active_section.next();
+                self.needs_redraw = true;
+            }
+            TuiAction::ListUp => {
+                self.library.select_previous(self.active_section);
+                self.needs_redraw = true;
+            }
+            TuiAction::ListDown => {
+                self.library.select_next(self.active_section);
+                self.needs_redraw = true;
+            }
+            TuiAction::ListPageUp => {
+                self.library.page_up(self.active_section, 10);
+                self.needs_redraw = true;
+            }
+            TuiAction::ListPageDown => {
+                self.library.page_down(self.active_section, 10);
+                self.needs_redraw = true;
+            }
+            TuiAction::ListFirst => {
+                self.library.select_first(self.active_section);
+                self.needs_redraw = true;
+            }
+            TuiAction::ListLast => {
+                self.library.select_last(self.active_section);
+                self.needs_redraw = true;
+            }
+            TuiAction::ToggleShuffle => {
+                self.shuffle_enabled = !self.shuffle_enabled;
+                self.needs_redraw = true;
+            }
+            TuiAction::CycleRepeat => {
+                self.repeat_mode = self.repeat_mode.next();
+                self.needs_redraw = true;
+            }
+            TuiAction::OpenSearch => {
+                self.active_section = NavSection::Search;
+                self.focus = FocusRegion::MainContent;
+                self.needs_redraw = true;
+            }
+            TuiAction::OpenLibrary => {
+                self.active_section = NavSection::Library;
+                self.focus = FocusRegion::MainContent;
+                self.needs_redraw = true;
+            }
+            TuiAction::SelectOrPlay
+            | TuiAction::TogglePlayPause
+            | TuiAction::NextTrack
+            | TuiAction::PreviousTrack
+            | TuiAction::SeekBackward
+            | TuiAction::SeekForward
+            | TuiAction::VolumeUp
+            | TuiAction::VolumeDown
+            | TuiAction::ToggleMute
+            | TuiAction::ToggleFavorite
+            | TuiAction::Noop => {}
         }
     }
 }
@@ -285,8 +317,14 @@ pub fn run_tui_loop_with_controller<B: Backend>(
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
             match event::read()? {
-                Event::Key(key) => state.handle_event(TuiInputEvent::Key(key)),
-                Event::Resize(cols, rows) => state.handle_event(TuiInputEvent::Resize(cols, rows)),
+                Event::Key(key) => {
+                    let action = state.handle_event(TuiInputEvent::Key(key));
+                    dispatch_playback_action(action, controller);
+                    state.sync_playback(controller.snapshot());
+                }
+                Event::Resize(cols, rows) => {
+                    state.handle_event(TuiInputEvent::Resize(cols, rows));
+                }
                 _ => {}
             }
         }
@@ -308,6 +346,7 @@ pub fn render_frame(frame: &mut Frame, state: &TuiState) {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
 
@@ -511,5 +550,56 @@ mod tests {
         tui_terminal.restore().unwrap();
         // Calling restore multiple times or dropping afterward must succeed cleanly
         tui_terminal.restore().unwrap();
+    }
+
+    #[test]
+    fn toggles_help_overlay_shuffle_repeat_and_quick_jumps() {
+        let mut state = TuiState::new();
+        state.terminal_size = (100, 30);
+
+        // Toggle help overlay with '?'
+        state.handle_event(TuiInputEvent::Key(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+        )));
+        assert!(state.show_help);
+        let help_render = render_to_string(100, 30, &state);
+        assert!(help_render.contains("Keyboard Shortcuts"));
+        assert!(help_render.contains("Play / Pause"));
+
+        // Pressing 'q' while help is open closes help without quitting
+        state.handle_event(TuiInputEvent::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!state.show_help);
+        assert!(!state.should_quit);
+
+        // Toggle shuffle and repeat
+        state.handle_event(TuiInputEvent::Key(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::NONE,
+        )));
+        state.handle_event(TuiInputEvent::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+        )));
+        assert!(state.shuffle_enabled);
+        assert_eq!(state.repeat_mode, RepeatMode::All);
+
+        // Quick jump to Search ('/') and Library ('l')
+        state.handle_event(TuiInputEvent::Key(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(state.active_section, NavSection::Search);
+        assert_eq!(state.focus, FocusRegion::MainContent);
+
+        state.handle_event(TuiInputEvent::Key(KeyEvent::new(
+            KeyCode::Char('l'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(state.active_section, NavSection::Library);
+        assert_eq!(state.focus, FocusRegion::MainContent);
     }
 }

@@ -11,7 +11,7 @@ Termwave is a lightweight, cross-platform, lossless-first terminal Hi-Fi music p
 
 ## Status
 
-Currently at **Phase 27 (Now-playing interface)** in **Stage 4 (Terminal User Interface)** of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play` plays local FLAC files with extracted Vorbis comments and artwork metadata, backed by a persistent SQLite library (`rusqlite`) with directory scanning (`walkdir`), indexing, FTS5/indexed search, favorites, and batched playback history, while `termwave tui` initializes Ratatui + Crossterm with a responsive dashboard layout, interactive library browser, and live now-playing display (track, artist, album, playback state, source/output audio format, and missing-metadata fallbacks). Full keyboard controls follow in Phase 28.
+Currently at **Phase 28 (Keyboard controls)** in **Stage 4 (Terminal User Interface)** of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play` plays local FLAC files with extracted Vorbis comments and artwork metadata, backed by a persistent SQLite library (`rusqlite`) with directory scanning (`walkdir`), indexing, FTS5/indexed search, favorites, and batched playback history, while `termwave tui` initializes Ratatui + Crossterm with a responsive dashboard layout, interactive library browser, live now-playing display, and conflict-free global/contextual keyboard shortcuts (`?` help overlay). Playback progress visualization follows in Phase 29.
 
 ## Usage
 
@@ -28,7 +28,7 @@ termwave tui
 - `src/main.rs` — Thin binary entry point
 - `src/lib.rs` — Core library exports
 - `src/cli.rs` — Command-line interface boundary
-- `src/tui/` — Terminal user interface (`mod.rs` loop, `terminal.rs` lifecycle, `layout.rs` dashboard, `browser.rs` library browser, `now_playing.rs` playback view model)
+- `src/tui/` — Terminal user interface (`mod.rs` loop, `terminal.rs` lifecycle, `layout.rs` dashboard, `browser.rs` library browser, `now_playing.rs` playback view model, `keymap.rs` shortcuts)
 - `src/audio/` — Audio engine boundary (`PlaybackState`, `validation`, `decoder`, `output`, `queue`, `volume`, and `playback`)
 - `src/metadata/` — Metadata (`mod.rs`) and embedded artwork (`artwork.rs`) boundary
 - `src/library/` — Music library directory scanning (`scanner.rs`), SQLite database/migrations (`db.rs`), indexing (`indexer.rs`), search (`search.rs`), favorites (`favorites.rs`), and playback history (`history.rs`) boundary
