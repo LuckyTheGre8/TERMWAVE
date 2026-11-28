@@ -31,9 +31,10 @@ src/
 - Handles command-line entry, `--help` / `--version`, and delegates work to lower-level subsystems (`audio`, `tui`).
 - Must not own decoding, audio device management, or database logic.
 
-### `tui` (`src/tui/mod.rs`, `src/tui/terminal.rs`)
+### `tui` (`src/tui/mod.rs`, `src/tui/terminal.rs`, `src/tui/layout.rs`)
 - Integrates `ratatui` and `crossterm` for the interactive terminal user interface (`termwave tui`).
 - Terminal lifecycle (`terminal.rs`): `TuiTerminal::enter()` enables raw mode, enters the alternate screen, hides the cursor, and installs a chained panic-restoration hook (`install_panic_restore_hook`). `TuiTerminal::restore()` and `Drop` guarantee idempotent restoration on exit, error, or panic.
+- Responsive dashboard (`layout.rs`): `DashboardLayout::compute` adapts header, navigation sidebar (`NavSection` across Home, Library, Artists, Albums, Playlists, Queue, Favorites, Recently Played, Search, Settings), main content panel, and bottom playback bar across wide, medium, and compact terminal sizes.
 - Rendering loop (`mod.rs`): Event-driven `run_tui_loop` polls Crossterm events at `DEFAULT_TICK_RATE`, tracks dirty state (`needs_redraw`) to avoid excessive redraws, handles terminal resize events, and exits cleanly on `'q'`, `Esc`, `Ctrl+C`, or external shutdown signals.
 
 ### `audio` (`src/audio/`)

@@ -4,6 +4,7 @@
 //! the event-driven rendering loop while keeping audio decoding and playback
 //! decoupled.
 
+pub mod layout;
 pub mod terminal;
 
 use std::io::{self, IsTerminal};
@@ -14,12 +15,9 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::backend::Backend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
 use thiserror::Error;
 
+pub use layout::{DashboardLayout, FocusRegion, NavSection, render_dashboard};
 pub use terminal::{TuiTerminal, install_panic_restore_hook, restore_terminal_state};
 
 /// Default event polling interval for the TUI rendering loop.
@@ -60,6 +58,10 @@ pub struct TuiState {
     pub terminal_size: (u16, u16),
     /// Total frames rendered so far.
     pub rendered_frames: u64,
+    /// Currently selected navigation section in the sidebar.
+    pub active_section: NavSection,
+    /// Currently focused dashboard region.
+    pub focus: FocusRegion,
 }
 
 impl Default for TuiState {
@@ -69,6 +71,8 @@ impl Default for TuiState {
             needs_redraw: true,
             terminal_size: (0, 0),
             rendered_frames: 0,
+            active_section: NavSection::default(),
+            focus: FocusRegion::default(),
         }
     }
 }
@@ -88,6 +92,23 @@ impl TuiState {
                     && key.modifiers.contains(KeyModifiers::CONTROL));
                 if is_quit_key {
                     self.should_quit = true;
+                    return;
+                }
+
+                match key.code {
+                    KeyCode::Tab => {
+                        self.focus = self.focus.next();
+                        self.needs_redraw = true;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if self.focus == FocusRegion::Sidebar => {
+                        self.active_section = self.active_section.previous();
+                        self.needs_redraw = true;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if self.focus == FocusRegion::Sidebar => {
+                        self.active_section = self.active_section.next();
+                        self.needs_redraw = true;
+                    }
+                    _ => {}
                 }
             }
             TuiInputEvent::Resize(cols, rows) => {
@@ -157,77 +178,102 @@ pub fn run_tui_loop<B: Backend>(
     Ok(state)
 }
 
-/// Renders the initial Termwave TUI frame (expanded into full dashboard panels in Phase 25+).
+/// Renders the Termwave dashboard layout into `frame`.
 pub fn render_frame(frame: &mut Frame, state: &TuiState) {
-    let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(3),
-        ])
-        .split(area);
-
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " TERMWAVE ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(
-            "v{} — Lossless-First Terminal Hi-Fi Player",
-            env!("CARGO_PKG_VERSION")
-        )),
-    ]))
-    .alignment(Alignment::Left)
-    .block(Block::default().borders(Borders::ALL).title("Status"));
-    frame.render_widget(header, chunks[0]);
-
-    let body = Paragraph::new(vec![
-        Line::from("Terminal UI initialized (Ratatui + Crossterm)."),
-        Line::from(format!(
-            "Viewport: {}x{} | Rendered frames: {}",
-            area.width, area.height, state.rendered_frames
-        )),
-    ])
-    .alignment(Alignment::Center)
-    .block(Block::default().borders(Borders::ALL).title("Termwave"));
-    frame.render_widget(body, chunks[1]);
-
-    let footer = Paragraph::new("Press 'q', Esc, or Ctrl+C to exit")
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(Color::DarkGray))
-        .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(footer, chunks[2]);
+    render_dashboard(frame, state);
 }
 
 #[cfg(test)]
 mod tests {
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
 
     use super::*;
 
-    #[test]
-    fn renders_initial_frame_into_test_backend_without_panic() {
-        let backend = TestBackend::new(80, 24);
+    fn render_to_string(width: u16, height: u16, state: &TuiState) -> String {
+        let backend = TestBackend::new(width, height);
         let mut tui_terminal = TuiTerminal::with_backend(backend).unwrap();
+        tui_terminal
+            .inner_mut()
+            .draw(|frame| render_frame(frame, state))
+            .unwrap();
+        tui_terminal
+            .inner()
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn renders_dashboard_header_sidebar_main_and_playback_bar() {
         let state = TuiState {
-            terminal_size: (80, 24),
+            terminal_size: (100, 30),
             ..TuiState::default()
         };
 
-        tui_terminal
-            .inner_mut()
-            .draw(|frame| render_frame(frame, &state))
-            .unwrap();
-
-        let buffer = tui_terminal.inner().backend().buffer();
-        let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        let content = render_to_string(100, 30, &state);
         assert!(content.contains("TERMWAVE"));
-        assert!(content.contains("80x24"));
-        assert!(content.contains("Press 'q', Esc, or Ctrl+C to exit"));
+        assert!(content.contains("Navigation"));
+        assert!(content.contains("Library"));
+        assert!(content.contains("Artists"));
+        assert!(content.contains("Albums"));
+        assert!(content.contains("Favorites"));
+        assert!(content.contains("Now Playing"));
+        assert!(content.contains("Stopped"));
+    }
+
+    #[test]
+    fn supports_responsive_resizing_including_compact_viewports() {
+        let wide = DashboardLayout::compute(Rect::new(0, 0, 120, 40));
+        assert!(wide.sidebar.is_some());
+        assert_eq!(wide.sidebar.unwrap().width, 22);
+        assert_eq!(wide.header.height, 3);
+        assert_eq!(wide.playback_bar.height, 4);
+
+        let medium = DashboardLayout::compute(Rect::new(0, 0, 60, 14));
+        assert!(medium.sidebar.is_some());
+        assert_eq!(medium.sidebar.unwrap().width, 17);
+        assert_eq!(medium.playback_bar.height, 3);
+
+        // Ultra-compact viewport collapses sidebar without panicking
+        let narrow = DashboardLayout::compute(Rect::new(0, 0, 36, 10));
+        assert!(narrow.sidebar.is_none());
+        assert_eq!(narrow.header.height, 1);
+
+        let state = TuiState {
+            terminal_size: (36, 10),
+            ..TuiState::default()
+        };
+        let compact_render = render_to_string(36, 10, &state);
+        assert!(compact_render.contains("TERMWAVE"));
+    }
+
+    #[test]
+    fn navigates_sidebar_sections_and_cycles_focus() {
+        let mut state = TuiState::default();
+        assert_eq!(state.focus, FocusRegion::Sidebar);
+        assert_eq!(state.active_section, NavSection::Library);
+
+        state.handle_event(TuiInputEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(state.active_section, NavSection::Artists);
+
+        state.handle_event(TuiInputEvent::Key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(state.active_section, NavSection::Library);
+
+        state.handle_event(TuiInputEvent::Key(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(state.focus, FocusRegion::MainContent);
     }
 
     #[test]
