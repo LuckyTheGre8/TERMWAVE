@@ -11,7 +11,7 @@ Termwave is a lightweight, cross-platform, lossless-first terminal Hi-Fi music p
 
 ## Status
 
-Currently at **Phase 21 (Music search)** in Stage 3 (Metadata and Music Library) of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play` integrates `lofty` to extract FLAC Vorbis comments and embedded album artwork while gracefully supporting missing tags and malformed metadata without playback failure, alongside consecutive track lookahead, decoder preloading, hardware audio stream reuse, volume/mute state preservation across tracks, centralized state tracking, non-blocking recursive directory scanning (`walkdir`), transactional SQLite library indexing (`rusqlite`), and indexed partial-match search across tracks, artists, and albums (`COLLATE NOCASE` indexes + FTS5). Favorites support follows in Phase 22.
+Currently at **Phase 22 (Favorites)** in Stage 3 (Metadata and Music Library) of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play` integrates `lofty` to extract FLAC Vorbis comments and embedded album artwork while gracefully supporting missing tags and malformed metadata without playback failure, alongside consecutive track lookahead, decoder preloading, hardware audio stream reuse, volume/mute state preservation across tracks, centralized state tracking, non-blocking recursive directory scanning (`walkdir`), transactional SQLite library indexing (`rusqlite`), indexed partial-match search (`COLLATE NOCASE` + FTS5), and persistent favorite tracks with missing-file handling. Playback history follows in Phase 23.
 
 ## Usage
 
@@ -29,7 +29,7 @@ termwave play --volume 80 <file>
 - `src/cli.rs` — Command-line interface boundary
 - `src/audio/` — Audio engine boundary (`PlaybackState`, `validation`, `decoder`, `output`, `queue`, `volume`, and `playback`)
 - `src/metadata/` — Metadata (`mod.rs`) and embedded artwork (`artwork.rs`) boundary
-- `src/library/` — Music library directory scanning (`scanner.rs`), SQLite database/migrations (`db.rs`), indexing (`indexer.rs`), and search (`search.rs`) boundary
+- `src/library/` — Music library directory scanning (`scanner.rs`), SQLite database/migrations (`db.rs`), indexing (`indexer.rs`), search (`search.rs`), and favorites (`favorites.rs`) boundary
 - `src/config.rs` — Configuration boundary
 - `src/error.rs` — Unified `TermwaveError` (`thiserror`) and `Result<T>`
 

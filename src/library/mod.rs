@@ -5,6 +5,7 @@
 //! on this subsystem.
 
 pub mod db;
+pub mod favorites;
 pub mod indexer;
 pub mod scanner;
 pub mod search;
@@ -14,6 +15,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 pub use db::{AlbumRecord, ArtistRecord, LibraryDatabase, NewTrackRecord, TrackRecord};
+pub use favorites::FavoriteTrack;
 pub use indexer::{
     IndexOptions, IndexSummary, index_directory, index_scan_summary, rescan_library,
 };
@@ -42,6 +44,10 @@ pub enum LibraryError {
     /// Permission denied accessing a scan root directory.
     #[error("permission denied accessing directory: {path}")]
     PermissionDenied { path: PathBuf },
+
+    /// Referenced track record does not exist in the library database.
+    #[error("track not found in library database: id {track_id}")]
+    TrackNotFound { track_id: i64 },
 
     /// Database migration failed.
     #[error("library migration failed at version {version}: {message}")]

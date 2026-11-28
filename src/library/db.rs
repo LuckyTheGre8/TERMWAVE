@@ -107,6 +107,18 @@ const MIGRATIONS: &[Migration] = &[
         INSERT INTO tracks_fts(tracks_fts) VALUES('rebuild');
     ",
     },
+    Migration {
+        version: 3,
+        name: "create_favorites_table",
+        sql: "
+        CREATE TABLE IF NOT EXISTS favorites (
+            track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+            date_added INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_favorites_date_added ON favorites(date_added DESC);
+    ",
+    },
 ];
 
 /// Stored artist row.
@@ -700,7 +712,7 @@ pub(crate) fn row_to_track_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<T
     })
 }
 
-fn unix_timestamp_secs() -> i64 {
+pub(crate) fn unix_timestamp_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -714,11 +726,11 @@ mod tests {
     #[test]
     fn opens_in_memory_and_runs_idempotent_migrations() {
         let mut db = LibraryDatabase::open_in_memory().expect("open in-memory db");
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), 3);
 
         // Re-running migrations should be a safe no-op
         db.run_migrations().expect("idempotent migrations");
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -729,7 +741,7 @@ mod tests {
 
         {
             let db = LibraryDatabase::open(&db_path).expect("create persistent db");
-            assert_eq!(db.schema_version().unwrap(), 2);
+            assert_eq!(db.schema_version().unwrap(), 3);
             let artist = db.upsert_artist("Miles Davis").unwrap();
             let album = db
                 .upsert_album("Kind of Blue", Some(artist.id), Some(1959), Some("cover_1"))
