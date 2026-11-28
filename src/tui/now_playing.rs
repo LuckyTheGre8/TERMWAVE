@@ -9,7 +9,7 @@ use ratatui::style::Color;
 use crate::audio::{PlaybackSnapshot, PlaybackState};
 
 /// Formatted now-playing display fields derived from a [`PlaybackSnapshot`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NowPlayingInfo {
     /// Current engine playback state.
     pub state: PlaybackState,
@@ -35,19 +35,30 @@ pub struct NowPlayingInfo {
     pub queue_label: Option<String>,
     /// Last playback error message, if any.
     pub last_error: Option<String>,
+    /// Elapsed playback position.
+    pub elapsed: Duration,
+    /// Total track duration, if known.
+    pub duration: Option<Duration>,
+    /// Formatted elapsed timestamp (`MM:SS` or `HH:MM:SS`).
+    pub elapsed_label: String,
+    /// Formatted total duration (`MM:SS`, `HH:MM:SS`, or `--:--`).
+    pub total_label: String,
+    /// Normalized progress ratio clamped to `0.0..=1.0`.
+    pub progress_ratio: f64,
+    /// Whether the active track supports seeking.
+    pub seekable: bool,
 }
 
 impl NowPlayingInfo {
     /// Builds a [`NowPlayingInfo`] view model from a centralized [`PlaybackSnapshot`].
     pub fn from_snapshot(snapshot: &PlaybackSnapshot) -> Self {
         let (state_label, state_color) = format_state_badge(snapshot.state);
-        let position_label = format!(
-            "{} / {}",
-            format_duration(snapshot.position),
-            snapshot
-                .duration
-                .map_or_else(|| "--:--".to_string(), format_duration)
-        );
+        let elapsed_label = format_duration(snapshot.position);
+        let total_label = snapshot
+            .duration
+            .map_or_else(|| "--:--".to_string(), format_duration);
+        let position_label = format!("{elapsed_label} / {total_label}");
+        let progress_ratio = compute_progress_ratio(snapshot.position, snapshot.duration);
         let volume_label = if snapshot.muted {
             format!("Vol {}% (muted)", snapshot.volume_percent)
         } else {
@@ -95,6 +106,12 @@ impl NowPlayingInfo {
                 volume_label,
                 queue_label,
                 last_error: snapshot.last_error.clone(),
+                elapsed: snapshot.position,
+                duration: snapshot.duration,
+                elapsed_label,
+                total_label,
+                progress_ratio,
+                seekable: track.stream.seekable,
             }
         } else {
             Self {
@@ -110,9 +127,42 @@ impl NowPlayingInfo {
                 volume_label,
                 queue_label,
                 last_error: snapshot.last_error.clone(),
+                elapsed: snapshot.position,
+                duration: snapshot.duration,
+                elapsed_label,
+                total_label,
+                progress_ratio,
+                seekable: false,
             }
         }
     }
+}
+
+/// Computes a clamped `0.0..=1.0` progress ratio from `elapsed` and `duration`.
+pub fn compute_progress_ratio(elapsed: Duration, duration: Option<Duration>) -> f64 {
+    let Some(total) = duration else {
+        return 0.0;
+    };
+    let total_secs = total.as_secs_f64();
+    if total_secs <= 0.0 || !total_secs.is_finite() {
+        return 0.0;
+    }
+    (elapsed.as_secs_f64() / total_secs).clamp(0.0, 1.0)
+}
+
+/// Computes a seek target [`Duration`] for a horizontal position `col` inside `bar_width`.
+pub fn seek_target_from_column(
+    col: u16,
+    bar_x: u16,
+    bar_width: u16,
+    duration: Duration,
+) -> Option<Duration> {
+    if bar_width == 0 || duration.is_zero() {
+        return None;
+    }
+    let rel = col.saturating_sub(bar_x).min(bar_width);
+    let ratio = (rel as f64 / bar_width as f64).clamp(0.0, 1.0);
+    Some(Duration::from_secs_f64(duration.as_secs_f64() * ratio))
 }
 
 fn format_state_badge(state: PlaybackState) -> (&'static str, Color) {
@@ -143,9 +193,14 @@ fn fallback_filename(path: &Path) -> String {
 
 fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
-    let mins = total_secs / 60;
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
     let secs = total_secs % 60;
-    format!("{mins:02}:{secs:02}")
+    if hours > 0 {
+        format!("{hours}:{mins:02}:{secs:02}")
+    } else {
+        format!("{mins:02}:{secs:02}")
+    }
 }
 
 fn format_khz(sample_rate_hz: u32) -> String {
@@ -241,5 +296,31 @@ mod tests {
         assert!(!idle.has_track);
         assert_eq!(idle.state_label, "Stopped");
         assert_eq!(idle.title, "No track loaded");
+    }
+
+    #[test]
+    fn computes_progress_ratios_and_interactive_seek_targets() {
+        assert_eq!(compute_progress_ratio(Duration::from_secs(30), None), 0.0);
+        assert_eq!(
+            compute_progress_ratio(Duration::from_secs(30), Some(Duration::ZERO)),
+            0.0
+        );
+        assert!(
+            (compute_progress_ratio(Duration::from_secs(60), Some(Duration::from_secs(240)))
+                - 0.25)
+                .abs()
+                < 1e-9
+        );
+        assert_eq!(
+            compute_progress_ratio(Duration::from_secs(300), Some(Duration::from_secs(240))),
+            1.0
+        );
+
+        let mid = seek_target_from_column(60, 10, 100, Duration::from_secs(200)).unwrap();
+        assert_eq!(mid, Duration::from_secs(100));
+        assert_eq!(
+            seek_target_from_column(0, 0, 0, Duration::from_secs(200)),
+            None
+        );
     }
 }

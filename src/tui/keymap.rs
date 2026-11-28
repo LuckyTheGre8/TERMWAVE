@@ -86,6 +86,8 @@ pub enum TuiAction {
     SeekBackward,
     /// Seek forward (`Right` in PlaybackBar or `]`).
     SeekForward,
+    /// Seek to a percentage (`0..=90`) of total track duration (`0`..`9`).
+    SeekPercent(u8),
     /// Increase playback volume (`Up` in PlaybackBar or `+`/`=`).
     VolumeUp,
     /// Decrease playback volume (`Down` in PlaybackBar or `-`).
@@ -246,6 +248,10 @@ pub fn resolve_key_action(
         KeyCode::Char('-') => return TuiAction::VolumeDown,
         KeyCode::Char('[') => return TuiAction::SeekBackward,
         KeyCode::Char(']') => return TuiAction::SeekForward,
+        KeyCode::Char(d @ '0'..='9') => {
+            let pct = (d as u8 - b'0') * 10;
+            return TuiAction::SeekPercent(pct);
+        }
         KeyCode::Char('s') | KeyCode::Char('S') => return TuiAction::ToggleShuffle,
         KeyCode::Char('r') | KeyCode::Char('R') => return TuiAction::CycleRepeat,
         KeyCode::Char('/') => return TuiAction::OpenSearch,
@@ -306,6 +312,14 @@ pub fn dispatch_playback_action(action: TuiAction, controller: &PlaybackControll
         }
         TuiAction::SeekForward => {
             let _ = controller.seek_forward(DEFAULT_SEEK_STEP);
+        }
+        TuiAction::SeekPercent(pct) => {
+            let snap = controller.snapshot();
+            if let Some(total) = snap.duration {
+                let ratio = (f64::from(pct.min(100))) / 100.0;
+                let target = std::time::Duration::from_secs_f64(total.as_secs_f64() * ratio);
+                let _ = controller.seek(target);
+            }
         }
         TuiAction::VolumeUp => {
             controller.increase_volume();

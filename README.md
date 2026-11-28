@@ -11,7 +11,7 @@ Termwave is a lightweight, cross-platform, lossless-first terminal Hi-Fi music p
 
 ## Status
 
-Currently at **Phase 28 (Keyboard controls)** in **Stage 4 (Terminal User Interface)** of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play` plays local FLAC files with extracted Vorbis comments and artwork metadata, backed by a persistent SQLite library (`rusqlite`) with directory scanning (`walkdir`), indexing, FTS5/indexed search, favorites, and batched playback history, while `termwave tui` initializes Ratatui + Crossterm with a responsive dashboard layout, interactive library browser, live now-playing display, and conflict-free global/contextual keyboard shortcuts (`?` help overlay). Playback progress visualization follows in Phase 29.
+Currently at **Phase 29 (Playback progress)** in **Stage 4 (Terminal User Interface)** of the development roadmap in [AGENTS.md](AGENTS.md). `termwave play` plays local FLAC files with extracted Vorbis comments and artwork metadata, backed by a persistent SQLite library (`rusqlite`) with directory scanning (`walkdir`), indexing, FTS5/indexed search, favorites, and batched playback history, while `termwave tui` initializes Ratatui + Crossterm with a responsive dashboard layout, interactive library browser, live now-playing display, conflict-free keyboard shortcuts (`?` help overlay), and a redraw-throttled playback progress bar with interactive seeking. Interactive playback queue management follows in Phase 30.
 
 ## Usage
 

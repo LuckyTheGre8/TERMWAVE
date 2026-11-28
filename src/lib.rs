@@ -28,6 +28,7 @@ pub use metadata::{
 pub use tui::{
     DEFAULT_TICK_RATE, DOCUMENTED_SHORTCUTS, DashboardLayout, FocusRegion, LibraryBrowser,
     ListCursor, NavSection, NowPlayingInfo, RepeatMode, ShortcutDoc, TuiAction, TuiError,
-    TuiInputEvent, TuiState, TuiTerminal, dispatch_playback_action, render_dashboard,
-    resolve_key_action, run_tui, run_tui_with_controller,
+    TuiInputEvent, TuiState, TuiTerminal, compute_progress_ratio, dispatch_playback_action,
+    render_dashboard, resolve_key_action, run_tui, run_tui_with_controller,
+    seek_target_from_column,
 };

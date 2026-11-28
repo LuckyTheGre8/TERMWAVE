@@ -29,7 +29,7 @@ pub use keymap::{
     resolve_key_action,
 };
 pub use layout::{DashboardLayout, FocusRegion, NavSection, render_dashboard};
-pub use now_playing::NowPlayingInfo;
+pub use now_playing::{NowPlayingInfo, compute_progress_ratio, seek_target_from_column};
 pub use terminal::{TuiTerminal, install_panic_restore_hook, restore_terminal_state};
 
 /// Default event polling interval for the TUI rendering loop.
@@ -246,6 +246,7 @@ impl TuiState {
             | TuiAction::PreviousTrack
             | TuiAction::SeekBackward
             | TuiAction::SeekForward
+            | TuiAction::SeekPercent(_)
             | TuiAction::VolumeUp
             | TuiAction::VolumeDown
             | TuiAction::ToggleMute
@@ -393,12 +394,12 @@ mod tests {
         assert!(wide.sidebar.is_some());
         assert_eq!(wide.sidebar.unwrap().width, 22);
         assert_eq!(wide.header.height, 3);
-        assert_eq!(wide.playback_bar.height, 4);
+        assert_eq!(wide.playback_bar.height, 5);
 
         let medium = DashboardLayout::compute(Rect::new(0, 0, 60, 14));
         assert!(medium.sidebar.is_some());
         assert_eq!(medium.sidebar.unwrap().width, 17);
-        assert_eq!(medium.playback_bar.height, 3);
+        assert_eq!(medium.playback_bar.height, 4);
 
         // Ultra-compact viewport collapses sidebar without panicking
         let narrow = DashboardLayout::compute(Rect::new(0, 0, 36, 10));
@@ -601,5 +602,33 @@ mod tests {
         )));
         assert_eq!(state.active_section, NavSection::Library);
         assert_eq!(state.focus, FocusRegion::MainContent);
+    }
+
+    #[test]
+    fn sync_playback_throttles_subsecond_redraws_and_renders_progress_bar() {
+        let mut state = TuiState::new();
+        state.terminal_size = (100, 30);
+        state.needs_redraw = false;
+
+        let mut snap = PlaybackController::new().snapshot();
+        snap.position = Duration::from_millis(10_200);
+        snap.duration = Some(Duration::from_secs(100));
+        state.sync_playback(snap.clone());
+        assert!(state.needs_redraw);
+        state.needs_redraw = false;
+
+        // Sub-second advance within same displayed second (10s) must NOT force redraw
+        snap.position = Duration::from_millis(10_850);
+        state.sync_playback(snap.clone());
+        assert!(!state.needs_redraw);
+
+        // Crossing into second 11 triggers redraw
+        snap.position = Duration::from_millis(11_050);
+        state.sync_playback(snap);
+        assert!(state.needs_redraw);
+
+        let rendered = render_to_string(100, 30, &state);
+        assert!(rendered.contains("00:11"));
+        assert!(rendered.contains("01:40"));
     }
 }

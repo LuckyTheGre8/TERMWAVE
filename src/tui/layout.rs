@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, LineGauge, List, ListItem, ListState, Paragraph};
 
 use super::TuiState;
 use super::keymap::DOCUMENTED_SHORTCUTS;
@@ -137,7 +137,13 @@ impl DashboardLayout {
     /// Computes responsive dashboard regions for the given terminal viewport `area`.
     pub fn compute(area: Rect) -> Self {
         let header_height = if area.height < 12 { 1 } else { 3 };
-        let playback_height = if area.height < 16 { 3 } else { 4 };
+        let playback_height = if area.height < 14 {
+            3
+        } else if area.height < 18 {
+            4
+        } else {
+            5
+        };
 
         let vertical = Layout::default()
             .direction(Direction::Vertical)
@@ -614,6 +620,17 @@ fn render_playback_bar(frame: &mut Frame, area: Rect, state: &TuiState) {
     let border_style = region_border_style(is_focused);
     let np = state.now_playing();
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title("Now Playing");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
     let mut top_spans = vec![
         Span::styled(
             np.state_label,
@@ -652,22 +669,65 @@ fn render_playback_bar(frame: &mut Frame, area: Rect, state: &TuiState) {
         let shuffle_label = if state.shuffle_enabled { "On" } else { "Off" };
         Line::from(Span::styled(
             format!(
-                "{}  |  {}  |  Shuffle: {shuffle_label}  |  Repeat: {}  |  {}",
-                np.position_label, np.volume_label, state.repeat_mode, np.audio_info
+                "{}  |  Shuffle: {shuffle_label}  |  Repeat: {}  |  {}",
+                np.volume_label, state.repeat_mode, np.audio_info
             ),
             Style::default().fg(Color::DarkGray),
         ))
     };
 
-    let bar = Paragraph::new(vec![Line::from(top_spans), bottom_line])
-        .alignment(Alignment::Left)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title("Now Playing"),
+    if inner.height >= 3 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        frame.render_widget(
+            Paragraph::new(Line::from(top_spans)).alignment(Alignment::Left),
+            rows[0],
         );
-    frame.render_widget(bar, area);
+
+        let elapsed_width = (np.elapsed_label.len() as u16).saturating_add(1);
+        let total_width = (np.total_label.len() as u16).saturating_add(1);
+        let progress_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(elapsed_width),
+                Constraint::Min(4),
+                Constraint::Length(total_width),
+            ])
+            .split(rows[1]);
+
+        frame.render_widget(
+            Paragraph::new(np.elapsed_label).style(Style::default().fg(Color::Cyan)),
+            progress_cols[0],
+        );
+        let gauge = LineGauge::default()
+            .filled_style(Style::default().fg(Color::Cyan))
+            .unfilled_style(Style::default().fg(Color::DarkGray))
+            .label("")
+            .ratio(np.progress_ratio);
+        frame.render_widget(gauge, progress_cols[1]);
+        frame.render_widget(
+            Paragraph::new(np.total_label)
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(Color::Gray)),
+            progress_cols[2],
+        );
+
+        frame.render_widget(
+            Paragraph::new(bottom_line).alignment(Alignment::Left),
+            rows[2],
+        );
+    } else {
+        let info =
+            Paragraph::new(vec![Line::from(top_spans), bottom_line]).alignment(Alignment::Left);
+        frame.render_widget(info, inner);
+    }
 }
 
 fn region_border_style(focused: bool) -> Style {
