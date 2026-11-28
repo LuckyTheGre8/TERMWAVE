@@ -6,6 +6,7 @@
 
 pub mod browser;
 pub mod layout;
+pub mod now_playing;
 pub mod terminal;
 
 use std::io::{self, IsTerminal};
@@ -18,10 +19,12 @@ use ratatui::Frame;
 use ratatui::backend::Backend;
 use thiserror::Error;
 
+use crate::audio::{PlaybackController, PlaybackSnapshot};
 use crate::library::{LibraryDatabase, LibraryError};
 
 pub use browser::{LibraryBrowser, ListCursor};
 pub use layout::{DashboardLayout, FocusRegion, NavSection, render_dashboard};
+pub use now_playing::NowPlayingInfo;
 pub use terminal::{TuiTerminal, install_panic_restore_hook, restore_terminal_state};
 
 /// Default event polling interval for the TUI rendering loop.
@@ -52,7 +55,7 @@ pub enum TuiInputEvent {
 }
 
 /// Core state tracked by the TUI rendering loop.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TuiState {
     /// Whether the loop should terminate cleanly.
     pub should_quit: bool,
@@ -68,6 +71,8 @@ pub struct TuiState {
     pub focus: FocusRegion,
     /// Interactive music library browser state.
     pub library: LibraryBrowser,
+    /// Latest centralized playback snapshot synchronized from `PlaybackController`.
+    pub playback: PlaybackSnapshot,
 }
 
 impl Default for TuiState {
@@ -87,6 +92,7 @@ impl TuiState {
             active_section: NavSection::default(),
             focus: FocusRegion::default(),
             library: LibraryBrowser::default(),
+            playback: PlaybackController::new().snapshot(),
         }
     }
 
@@ -103,6 +109,26 @@ impl TuiState {
         self.library.load_from_database(db)?;
         self.needs_redraw = true;
         Ok(())
+    }
+
+    /// Synchronizes centralized playback state and marks `needs_redraw` only
+    /// when visible playback fields changed.
+    pub fn sync_playback(&mut self, snapshot: PlaybackSnapshot) {
+        let changed = self.playback.revision != snapshot.revision
+            || self.playback.state != snapshot.state
+            || self.playback.position.as_secs() != snapshot.position.as_secs()
+            || self.playback.volume_percent != snapshot.volume_percent
+            || self.playback.muted != snapshot.muted
+            || self.playback.last_error != snapshot.last_error;
+        self.playback = snapshot;
+        if changed {
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Builds a formatted [`NowPlayingInfo`] view model from the current snapshot.
+    pub fn now_playing(&self) -> NowPlayingInfo {
+        NowPlayingInfo::from_snapshot(&self.playback)
     }
 
     /// Processes a single [`TuiInputEvent`] and updates dirty/quit state.
@@ -200,12 +226,21 @@ impl TuiState {
 /// Launches the interactive terminal user interface on the current TTY and
 /// guarantees terminal restoration upon exit or error.
 pub fn run_tui(shutdown: Arc<AtomicBool>) -> Result<(), TuiError> {
+    run_tui_with_controller(PlaybackController::new(), shutdown)
+}
+
+/// Launches the interactive terminal user interface connected to `controller`.
+pub fn run_tui_with_controller(
+    controller: PlaybackController,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), TuiError> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(TuiError::NotATerminal);
     }
 
     let mut terminal = TuiTerminal::enter()?;
-    let result = run_tui_loop(&mut terminal, shutdown, DEFAULT_TICK_RATE);
+    let result =
+        run_tui_loop_with_controller(&mut terminal, &controller, shutdown, DEFAULT_TICK_RATE);
     let restore_res = terminal.restore();
 
     result?;
@@ -219,7 +254,19 @@ pub fn run_tui_loop<B: Backend>(
     shutdown: Arc<AtomicBool>,
     tick_rate: Duration,
 ) -> Result<TuiState, TuiError> {
+    let controller = PlaybackController::new();
+    run_tui_loop_with_controller(terminal, &controller, shutdown, tick_rate)
+}
+
+/// Executes the event-driven rendering loop synchronized with `controller`.
+pub fn run_tui_loop_with_controller<B: Backend>(
+    terminal: &mut TuiTerminal<B>,
+    controller: &PlaybackController,
+    shutdown: Arc<AtomicBool>,
+    tick_rate: Duration,
+) -> Result<TuiState, TuiError> {
     let mut state = TuiState::new();
+    state.sync_playback(controller.snapshot());
     if let Ok(area) = terminal.inner().size() {
         state.terminal_size = (area.width, area.height);
     }
@@ -246,6 +293,7 @@ pub fn run_tui_loop<B: Backend>(
 
         if last_tick.elapsed() >= tick_rate {
             state.handle_event(TuiInputEvent::Tick);
+            state.sync_playback(controller.snapshot());
             last_tick = Instant::now();
         }
     }

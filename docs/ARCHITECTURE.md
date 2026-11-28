@@ -31,12 +31,13 @@ src/
 - Handles command-line entry, `--help` / `--version`, and delegates work to lower-level subsystems (`audio`, `tui`).
 - Must not own decoding, audio device management, or database logic.
 
-### `tui` (`src/tui/mod.rs`, `src/tui/terminal.rs`, `src/tui/layout.rs`, `src/tui/browser.rs`)
+### `tui` (`src/tui/mod.rs`, `src/tui/terminal.rs`, `src/tui/layout.rs`, `src/tui/browser.rs`, `src/tui/now_playing.rs`)
 - Integrates `ratatui` and `crossterm` for the interactive terminal user interface (`termwave tui`).
 - Terminal lifecycle (`terminal.rs`): `TuiTerminal::enter()` enables raw mode, enters the alternate screen, hides the cursor, and installs a chained panic-restoration hook (`install_panic_restore_hook`). `TuiTerminal::restore()` and `Drop` guarantee idempotent restoration on exit, error, or panic.
 - Responsive dashboard (`layout.rs`): `DashboardLayout::compute` adapts header, navigation sidebar (`NavSection` across Home, Library, Artists, Albums, Playlists, Queue, Favorites, Recently Played, Search, Settings), main content panel, and bottom playback bar across wide, medium, and compact terminal sizes.
 - Library browser (`browser.rs`): `LibraryBrowser` and `ListCursor` connect `LibraryDatabase` queries (`list_tracks`, `list_albums`, `list_artists`, `list_favorites`, `recently_played_unique_tracks`) with per-section keyboard selection (`Up`/`Down`, `j`/`k`, `PageUp`/`PageDown`, `Home`/`End`) and focus transitions (`Enter`/`Esc`/`Tab`).
-- Rendering loop (`mod.rs`): Event-driven `run_tui_loop` polls Crossterm events at `DEFAULT_TICK_RATE`, tracks dirty state (`needs_redraw`) to avoid excessive redraws, handles terminal resize events, and exits cleanly on `'q'`, `Esc`, `Ctrl+C`, or external shutdown signals.
+- Now-playing (`now_playing.rs`): `NowPlayingInfo` formats current track, artist, album, playback state badge, volume, and source-vs-output audio properties from `PlaybackSnapshot`, with clean fallbacks when metadata is missing.
+- Rendering loop (`mod.rs`): Event-driven `run_tui_loop` polls Crossterm events at `DEFAULT_TICK_RATE`, synchronizes `PlaybackSnapshot` changes without redundant redraws, handles terminal resize events, and exits cleanly on `'q'`, `Esc`, `Ctrl+C`, or external shutdown signals.
 
 ### `audio` (`src/audio/`)
 - Owns local file validation (`validation.rs`), source-agnostic FLAC decoding (`decoder.rs` powered by Symphonia), system audio output initialization (`output.rs` encapsulating `rodio`/`cpal`), bounded-channel playback execution and control (`playback.rs` with `PlaybackController`), and the validated `PlaybackState` lifecycle (`mod.rs`).

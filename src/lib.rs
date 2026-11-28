@@ -27,5 +27,6 @@ pub use metadata::{
 };
 pub use tui::{
     DEFAULT_TICK_RATE, DashboardLayout, FocusRegion, LibraryBrowser, ListCursor, NavSection,
-    TuiError, TuiInputEvent, TuiState, TuiTerminal, render_dashboard, run_tui,
+    NowPlayingInfo, TuiError, TuiInputEvent, TuiState, TuiTerminal, render_dashboard, run_tui,
+    run_tui_with_controller,
 };

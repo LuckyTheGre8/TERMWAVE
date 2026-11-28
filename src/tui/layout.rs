@@ -182,10 +182,12 @@ pub fn render_dashboard(frame: &mut Frame, state: &TuiState) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
+    let np = state.now_playing();
     let status_text = format!(
-        "v{}  |  {}  |  {}x{}",
+        "v{}  |  {}  |  {}  |  {}x{}",
         env!("CARGO_PKG_VERSION"),
         state.active_section.label(),
+        np.state_label,
         state.terminal_size.0,
         state.terminal_size.1
     );
@@ -443,14 +445,14 @@ fn render_main_content(frame: &mut Frame, area: Rect, state: &TuiState) {
             );
         }
         NavSection::Home => {
-            let lines = vec![
+            let np = state.now_playing();
+            let mut lines = vec![
                 Line::from(Span::styled(
                     "Library Overview",
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 )),
-                Line::from(""),
                 Line::from(format!(
                     "Tracks: {}  |  Albums: {}  |  Artists: {}  |  Favorites: {}",
                     state.library.tracks.len(),
@@ -460,10 +462,36 @@ fn render_main_content(frame: &mut Frame, area: Rect, state: &TuiState) {
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Tab / Enter: focus list  |  Up/Down (j/k): navigate  |  q: quit",
-                    Style::default().fg(Color::DarkGray),
+                    "Now Playing",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
                 )),
+                Line::from(vec![
+                    Span::styled(
+                        format!("[{}] ", np.state_label),
+                        Style::default()
+                            .fg(np.state_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(np.title, Style::default().fg(Color::White)),
+                ]),
             ];
+            if np.has_track {
+                lines.push(Line::from(Span::styled(
+                    format!("Artist: {}  |  Album: {}", np.artist, np.album),
+                    Style::default().fg(Color::Gray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!("Audio:  {}", np.audio_info),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Tab / Enter: focus list  |  Up/Down (j/k): navigate  |  q: quit",
+                Style::default().fg(Color::DarkGray),
+            )));
             let panel = Paragraph::new(lines)
                 .alignment(Alignment::Left)
                 .block(block);
@@ -579,29 +607,60 @@ fn format_duration_ms(duration_ms: Option<u64>) -> String {
 fn render_playback_bar(frame: &mut Frame, area: Rect, state: &TuiState) {
     let is_focused = state.focus == FocusRegion::PlaybackBar;
     let border_style = region_border_style(is_focused);
+    let np = state.now_playing();
 
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "Stopped",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  |  No track loaded"),
-        ]),
-        Line::from(Span::styled(
-            "00:00 / 00:00  |  Vol 100%  |  FLAC Lossless Engine Ready",
-            Style::default().fg(Color::DarkGray),
-        )),
+    let mut top_spans = vec![
+        Span::styled(
+            np.state_label,
+            Style::default()
+                .fg(np.state_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  |  "),
+        Span::styled(
+            np.title,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
     ];
 
-    let bar = Paragraph::new(lines).alignment(Alignment::Left).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style)
-            .title("Now Playing"),
-    );
+    if np.has_track {
+        top_spans.push(Span::styled(
+            format!("  —  {}  [{}]", np.artist, np.album),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    if let Some(queue) = np.queue_label {
+        top_spans.push(Span::styled(
+            format!("  {queue}"),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+
+    let bottom_line = if let Some(err) = np.last_error {
+        Line::from(Span::styled(
+            format!("Error: {err}"),
+            Style::default().fg(Color::Red),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{}  |  {}  |  {}",
+                np.position_label, np.volume_label, np.audio_info
+            ),
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+
+    let bar = Paragraph::new(vec![Line::from(top_spans), bottom_line])
+        .alignment(Alignment::Left)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title("Now Playing"),
+        );
     frame.render_widget(bar, area);
 }
 
